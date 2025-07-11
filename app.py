@@ -12,22 +12,22 @@ app.logger.setLevel(logging.INFO)
 
 @app.route('/', methods=['POST'])
 def handle_webhook():
-    app.logger.info("🔔 Webhook triggered!")
-    
+    app.logger.info("✅ Webhook hit")
+
     # Log request headers
     headers = dict(request.headers)
-    app.logger.info("📨 Headers:\n%s", headers)
+    app.logger.info("📩 Headers: %s", headers)
 
-    # Log raw body
+    # Log raw request body
     raw_body = request.data.decode('utf-8', errors='replace')
-    app.logger.info("📦 Raw Body:\n%s", raw_body)
+    app.logger.info("📦 Raw Body: %s", raw_body)
 
-    # Log parsed JSON (if possible)
+    # Attempt to parse JSON body
     json_data = request.get_json(silent=True)
     if json_data:
-        app.logger.info("📄 Parsed JSON:\n%s", json_data)
+        app.logger.info("📄 Parsed JSON: %s", json_data)
     else:
-        app.logger.warning("⚠️ No JSON payload could be parsed.")
+        app.logger.warning("⚠️ No JSON payload could be parsed. Raw body was: %s", raw_body)
 
     return '✅ Webhook received', 200
 
