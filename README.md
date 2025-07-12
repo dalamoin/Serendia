@@ -1,4 +1,4 @@
-# Build, Deploy, Route
+# Force new revision by changing a core service parameter
 source .env && \
 TIMESTAMP=$(date +%s) && \
 gcloud builds submit --config cloudbuild.yaml --project=serendia && \
