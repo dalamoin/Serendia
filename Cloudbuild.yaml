@@ -1,0 +1,13 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation']
+
+serviceAccount: 'projects/serendia/serviceAccounts/cloud-build-runner@serendia.iam.gserviceaccount.com'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  
+images:
+  - 'us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation'
