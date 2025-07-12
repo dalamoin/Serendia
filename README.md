@@ -2,7 +2,7 @@ Build the Container
 
 gcloud builds submit --config cloudbuild.yaml --project=serendia
 
-Deploy the application
+Build, Deploy and Route Traffic
 
 source .env && \
 TIMESTAMP=$(date +%s) && \
