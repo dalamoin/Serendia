@@ -1,25 +1,6 @@
-# Force new revision by changing a core service parameter
-#Force new revision by changing a core service parameter
-source .env && \
-TIMESTAMP=$(date +%s) && \
-gcloud builds submit --config cloudbuild.yaml --project=serendia && \
-gcloud run deploy po-automation \
-  --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:latest \
-  --platform managed \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --memory 512Mi \
-  --cpu 1 \
-  --timeout 300 \
-  --max-instances 10 \
-  --concurrency 80 \
-  --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},DEPLOY_TIME=${TIMESTAMP}" \
-  --no-traffic \
-  --project serendia && \
-gcloud run services update-traffic po-automation \
-  --to-latest \
-  --region=us-central1 \
-  --project=serendia
+Build and Deploy Container:
+
+source .env && TIMESTAMP=$(date +%s) && echo "Building with no-cache and timestamp: ${TIMESTAMP}" && gcloud builds submit --config cloudbuild.yaml --substitutions=_TIMESTAMP=${TIMESTAMP} --project=serendia && gcloud run deploy po-automation   --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${TIMESTAMP}   --platform managed   --region us-central1   --allow-unauthenticated   --memory 512Mi   --cpu 1   --timeout 300   --max-instances 10   --concurrency 80   --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},DEPLOY_TIME=${TIMESTAMP}"   --no-traffic   --project=serendia && gcloud run services update-traffic po-automation   --to-latest   --region=us-central1   --project=serendia
 
 Authenticate with Procore:
 https://sandbox.procore.com/oauth/authorize?client_id=DYg52m4iwM_3rkJ2RdplGPd_O2DHhw1cI8u6c_BHecw&response_type=code&redirect_uri=https://po-automation-68642982777.us-central1.run.app/oauth/callback
