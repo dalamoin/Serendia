@@ -1,4 +1,4 @@
-Build and Deploy Container:
+# Build and Deploy Container:
 
 source .env && TIMESTAMP=$(date +%s) && echo "Building with no-cache and timestamp: ${TIMESTAMP}" && gcloud builds submit --config cloudbuild.yaml --substitutions=_TIMESTAMP=${TIMESTAMP} --project=serendia && gcloud run deploy po-automation   --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${TIMESTAMP}   --platform managed   --region us-central1   --allow-unauthenticated   --memory 512Mi   --cpu 1   --timeout 300   --max-instances 10   --concurrency 80   --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},DEPLOY_TIME=${TIMESTAMP}"   --no-traffic   --project=serendia && gcloud run services update-traffic po-automation   --to-latest   --region=us-central1   --project=serendia
 
