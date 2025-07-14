@@ -28,11 +28,11 @@ PROCORE_ENVIRONMENT = os.environ.get('PROCORE_ENVIRONMENT', 'sandbox')  # sandbo
 @dataclass
 class ApprovalTier:
     """Approval tier definitions"""
-    AUTO_APPROVE = 1
-    PROJECT_MANAGER = 2
-    PROJECT_DIRECTOR = 3
-    OPERATIONS_MANAGER = 4
-    MANAGING_DIRECTOR = 5
+    TIER_1 = 1  # Revised Contract Amount < $5,000 and Under Revised Budget
+    TIER_2 = 2  # $5,000 < Revised Contract Amount < $10,000 and Under Revised Budget
+    TIER_3 = 3  # Revised Contract Amount > $10,000 and under Revised Budget OR PO Line Item Budget Code is 99-999 Unallocated Costs
+    TIER_4 = 4  # When Unapproved Change Order attached to PO
+    TIER_5 = 5  # Committed Costs > Revised Budget
 
 @dataclass
 class ProcoreWebhookPayload:
@@ -194,10 +194,52 @@ class ProcoreAPIClient:
                     logger.error(f"❌ Response text: {e.response.text}")
             return None
     
-    def get_po_line_items(self, project_id: str, po_id: str) -> Optional[List[Dict]]:
-        """Get PO line items - corrected endpoint"""
-        endpoint = f"/v1.0/projects/{project_id}/purchase_order_contracts/{po_id}/purchase_order_contract_line_items"
-        return self._make_request('GET', endpoint)
+    def get_po_line_items(self, project_id: str, po_id: str, company_id: str = None) -> Optional[List[Dict]]:
+        """Get PO data using the correct Procore API endpoint"""
+        # Use the correct endpoint structure with required project_id parameter
+        endpoint = f"/v1.0/purchase_order_contracts/{po_id}"
+        
+        # Add project_id as a query parameter (required per Procore documentation)
+        params = {'project_id': project_id}
+        
+        logger.info(f"🔍 Trying correct endpoint: {endpoint} with params: {params}")
+        result = self._make_request('GET', endpoint, params=params)
+        
+        if result is not None:
+            logger.info(f"✅ Successfully got PO data from: {endpoint}")
+            
+            # Check if we have line_items in the response
+            if 'line_items' in result:
+                logger.info(f"📝 Found {len(result['line_items'])} line items")
+                return result['line_items']
+            
+            # If no line_items but we have an amount, create a mock line item
+            elif 'amount' in result or 'total' in result or 'contract_amount' in result:
+                amount = result.get('amount') or result.get('total') or result.get('contract_amount', 0)
+                logger.info(f"📊 Got PO total amount: ${float(amount):,.2f}")
+                return [{'amount': amount}]
+            
+            # If we got the PO object but no clear amount, try to extract from other fields
+            else:
+                logger.info(f"📋 Got PO object: {list(result.keys())}")
+                # Log the structure to help debug
+                for key, value in result.items():
+                    if 'amount' in key.lower() or 'total' in key.lower():
+                        logger.info(f"💰 Found amount field {key}: {value}")
+                
+                # Try common amount field names
+                for amount_field in ['amount', 'total', 'contract_amount', 'grand_total', 'subtotal']:
+                    if amount_field in result and result[amount_field]:
+                        amount = float(result[amount_field])
+                        logger.info(f"📊 Using {amount_field}: ${amount:,.2f}")
+                        return [{'amount': amount}]
+                
+                # If still no amount found, return the raw result for debugging
+                logger.warning(f"⚠️ No amount field found in PO {po_id}")
+                return [{'amount': 0}]  # Return 0 to prevent None errors
+        
+        logger.error(f"❌ Could not retrieve PO {po_id} from endpoint {endpoint}")
+        return None
     
     def get_budget_line_item(self, budget_id: str) -> Optional[Dict]:
         """Get original budget line item"""
@@ -218,81 +260,246 @@ class ProcoreAPIClient:
             params['status'] = status
         return self._make_request('GET', endpoint, params=params)
     
+    def get_po_change_orders(self, po_id: str) -> Optional[List[Dict]]:
+        """Get change orders associated with a specific Purchase Order Contract"""
+        endpoint = f"/v1.0/purchase_order_contracts/{po_id}"
+        
+        logger.info(f"🔍 Getting change orders for PO {po_id}")
+        result = self._make_request('GET', endpoint)
+        
+        if result is not None:
+            change_order_packages = result.get('change_order_packages', [])
+            logger.info(f"📦 Found {len(change_order_packages)} change order packages for PO {po_id}")
+            
+            # Extract change orders with their status
+            change_orders = []
+            for package in change_order_packages:
+                if isinstance(package, dict):
+                    status = package.get('status', 'unknown')
+                    change_orders.append({
+                        'id': package.get('id'),
+                        'status': status,
+                        'package': package
+                    })
+                    logger.info(f"📋 Change Order Package {package.get('id')}: status={status}")
+            
+            return change_orders
+        else:
+            logger.error(f"❌ Failed to get change orders for PO {po_id}")
+            return None
+    
+    def get_commitment_change_order_line_items(self, company_id: str, project_id: str, commitment_change_order_id: str) -> Optional[List[Dict]]:
+        """Get line items for a specific commitment change order"""
+        endpoint = f"/v2.0/companies/{company_id}/projects/{project_id}/commitment_change_orders/{commitment_change_order_id}/line_items"
+        
+        logger.info(f"🔍 Getting line items for commitment change order {commitment_change_order_id}")
+        result = self._make_request('GET', endpoint)
+        
+        if result is not None:
+            logger.info(f"📋 Found {len(result) if isinstance(result, list) else 'some'} line items for change order {commitment_change_order_id}")
+            return result
+        else:
+            logger.error(f"❌ Failed to get line items for commitment change order {commitment_change_order_id}")
+            return None
+    
     def get_custom_field_definitions(self, project_id: str) -> Optional[List[Dict]]:
-        """Get custom field definitions for commitments - corrected endpoint"""
+        """Get custom field definitions for commitments - boolean fields only"""
         endpoint = f"/v1.0/projects/{project_id}/configurable_field_sets"
-        params = {'origin_id': 'commitments'}
-        return self._make_request('GET', endpoint, params=params)
+        params = {
+            'types[]': 'ConfigurableFieldSet::PurchaseOrderContract'
+            # Note: No longer includes dropdown list-of-values since fields are now boolean checkboxes
+        }
+        
+        logger.info(f"🔍 Getting custom field definitions from: {endpoint}")
+        result = self._make_request('GET', endpoint, params=params)
+        
+        if result is not None:
+            logger.info(f"✅ Successfully retrieved {len(result) if isinstance(result, list) else 'some'} field sets")
+        else:
+            logger.error(f"❌ Failed to retrieve custom field definitions")
+            
+        return result
     
     def get_custom_field_responses(self, project_id: str, commitment_id: str) -> Optional[List[Dict]]:
         """Get custom field responses for a commitment"""
         endpoint = f"/v1.0/projects/{project_id}/commitments/{commitment_id}/custom_field_responses"
         return self._make_request('GET', endpoint)
     
-    def update_commitment_custom_field(self, project_id: str, commitment_id: str, field_updates: Dict) -> bool:
-        """Update custom fields on a commitment (PO)"""
-        endpoint = f"/v1.0/projects/{project_id}/commitments/{commitment_id}"
+    def verify_custom_field_update(self, project_id: str, commitment_id: str, field_id: str) -> Optional[str]:
+        """Verify custom field update by reading back the value"""
+        endpoint = f"/v1.0/purchase_order_contracts/{commitment_id}"
+        params = {'project_id': project_id}
         
-        # Structure the payload for updating custom fields
+        logger.info(f"🔍 Verifying custom field update for PO {commitment_id}")
+        result = self._make_request('GET', endpoint, params=params)
+        
+        if result is not None:
+            # Look for custom field values in the response
+            custom_field_key = f"custom_field_{field_id}"
+            
+            # Check different possible locations for custom field values
+            locations_to_check = [
+                result,  # Direct in result
+                result.get('custom_fields', {}),  # In custom_fields object
+                result.get('custom_field_values', {}),  # In custom_field_values object
+            ]
+            
+            for i, location in enumerate(locations_to_check):
+                if isinstance(location, dict):
+                    if i == 1:  # custom_fields location
+                        logger.info(f"🔍 custom_fields content: {location}")
+                    if custom_field_key in location:
+                        current_value = location[custom_field_key]
+                        logger.info(f"✅ Verified: {custom_field_key} = '{current_value}' (location {i})")
+                        return current_value
+            
+            # Also check for the field name in the response
+            logger.info(f"🔍 PO response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+            logger.warning(f"⚠️ Custom field {custom_field_key} not found in response")
+            return None
+        else:
+            logger.error(f"❌ Failed to retrieve PO {commitment_id} for verification")
+            return None
+    
+    def update_commitment_custom_field(self, project_id: str, commitment_id: str, field_updates: Dict, company_id: str = None) -> bool:
+        """Update custom fields on a commitment (PO) using correct Procore API structure for boolean fields"""
+        # Use the correct Procore API endpoint for updating purchase order contracts
+        endpoint = f"/v1.0/purchase_order_contracts/{commitment_id}"
+        
+        # Convert field updates to the correct Procore format: custom_field_{id}
+        custom_fields = {}
+        for field_id, field_value in field_updates.items():
+            # Use the exact format from Procore documentation
+            custom_field_key = f"custom_field_{field_id}"
+            
+            # Convert boolean values to strings as required by Procore API
+            if isinstance(field_value, bool):
+                custom_fields[custom_field_key] = 'true' if field_value else 'false'
+            else:
+                custom_fields[custom_field_key] = field_value
+        
+        # Structure the payload according to Procore API documentation
         payload = {
-            'custom_field_values': field_updates
+            "project_id": int(project_id),
+            "purchase_order_contract": custom_fields
         }
         
+        logger.info(f"🔧 Updating PO {commitment_id} with custom fields: {custom_fields}")
+        logger.info(f"🔍 Using endpoint: {endpoint}")
+        logger.info(f"📦 Complete payload: {payload}")
+        
         result = self._make_request('PATCH', endpoint, json=payload)
-        return result is not None
+        
+        if result is not None:
+            logger.info(f"✅ Successfully updated custom fields on PO {commitment_id}")
+            return True
+        else:
+            logger.error(f"❌ Failed to update custom fields on PO {commitment_id}")
+            return False
     
-    def get_approval_tier_field_id(self, project_id: str) -> Optional[str]:
-        """Get the custom field definition ID for 'Approval Tier' field"""
+    def get_approval_tier_field_ids(self, project_id: str) -> Dict[str, Optional[str]]:
+        """Get the custom field definition IDs for all approval tier fields (Tier 1-5 checkboxes)"""
         field_sets = self.get_custom_field_definitions(project_id)
         if not field_sets:
-            return None
+            logger.error("❌ No configurable field sets found")
+            return {}
         
-        # Look through configurable field sets for approval tier field
-        for field_set in field_sets:
-            custom_fields = field_set.get('custom_fields', [])
-            for field in custom_fields:
-                field_name = field.get('name', '').lower()
-                if 'approval tier' in field_name or 'approval_tier' in field_name:
-                    return field.get('id')
+        logger.info(f"🔍 Found {len(field_sets)} configurable field sets")
         
-        logger.warning("⚠️ 'Approval Tier' custom field not found in any fieldset")
-        return None
+        # Initialize results dictionary
+        tier_fields = {
+            'Tier 1': None,
+            'Tier 2': None, 
+            'Tier 3': None,
+            'Tier 4': None,
+            'Tier 5': None
+        }
+        
+        # Look through configurable field sets for tier fields
+        for i, field_set in enumerate(field_sets):
+            logger.info(f"📋 Field set {i}: {field_set.get('name', 'Unnamed')} (type: {field_set.get('type', 'Unknown')})")
+            
+            # Check fields object
+            fields_obj = field_set.get('fields', {})
+            logger.info(f"🔍 Found {len(fields_obj)} fields in this set")
+            
+            for field_key, field_data in fields_obj.items():
+                if isinstance(field_data, dict):
+                    field_name = field_data.get('name', '')
+                    field_label = field_data.get('label', '')
+                    field_id = field_data.get('id') or field_data.get('custom_field_definition_id')
+                    field_type = field_data.get('field_type', '')
+                    
+                    logger.info(f"📝 Field '{field_key}': name='{field_name}', label='{field_label}', type='{field_type}' (ID: {field_id})")
+                    
+                    # Check if this is one of our tier fields (checkbox/boolean type)
+                    for tier_name in tier_fields.keys():
+                        if (field_name == tier_name or field_label == tier_name) and field_type in ['checkbox', 'boolean']:
+                            logger.info(f"✅ Found {tier_name} field: '{field_name}' / '{field_label}' (ID: {field_id}, Type: {field_type})")
+                            tier_fields[tier_name] = field_id
+        
+        # Log results
+        found_fields = {k: v for k, v in tier_fields.items() if v is not None}
+        missing_fields = [k for k, v in tier_fields.items() if v is None]
+        
+        if found_fields:
+            logger.info(f"✅ Found tier fields: {found_fields}")
+        if missing_fields:
+            logger.warning(f"⚠️ Missing tier fields: {missing_fields}")
+        
+        return tier_fields
     
-    def post_approval_decision(self, project_id: str, commitment_id: str, approval_tier: int, reason: str) -> bool:
-        """Post approval decision back to Procore by updating custom field"""
+    def post_approval_decision(self, project_id: str, commitment_id: str, approval_tier: int, reason: str, company_id: str = None) -> bool:
+        """Post approval decision back to Procore by updating tier checkbox custom fields"""
         try:
-            # Get the Approval Tier custom field ID
-            approval_field_id = self.get_approval_tier_field_id(project_id)
-            if not approval_field_id:
-                logger.error("❌ Cannot update approval tier: 'Approval Tier' custom field not found")
-                logger.info("💡 Please create an 'Approval Tier' custom field in Procore for commitments")
-                # Still return success so we can see the approval tier calculation in logs
+            # Get all the tier field IDs
+            tier_field_ids = self.get_approval_tier_field_ids(project_id)
+            if not any(tier_field_ids.values()):
+                logger.error("❌ Cannot update approval tier: No tier custom fields found")
+                logger.info("💡 Please create 'Tier 1', 'Tier 2', 'Tier 3', 'Tier 4', 'Tier 5' checkbox custom fields in Procore for commitments")
                 return True
             
-            # Map approval tier numbers to human-readable values
+            # Map approval tier numbers to tier names
             tier_mapping = {
-                ApprovalTier.AUTO_APPROVE: "Auto-Approval",
-                ApprovalTier.PROJECT_MANAGER: "Project Manager", 
-                ApprovalTier.PROJECT_DIRECTOR: "Project Director",
-                ApprovalTier.OPERATIONS_MANAGER: "Operations Manager",
-                ApprovalTier.MANAGING_DIRECTOR: "Managing Director"
+                ApprovalTier.TIER_1: "Tier 1",
+                ApprovalTier.TIER_2: "Tier 2", 
+                ApprovalTier.TIER_3: "Tier 3",
+                ApprovalTier.TIER_4: "Tier 4",
+                ApprovalTier.TIER_5: "Tier 5"
             }
             
-            approval_value = tier_mapping.get(approval_tier, "Managing Director")
+            target_tier_name = tier_mapping.get(approval_tier, "Tier 5")
             
-            # Prepare custom field update
-            field_updates = {
-                approval_field_id: approval_value
-            }
+            # Prepare custom field updates - set only the target tier to true, others to false
+            field_updates = {}
+            for tier_name, field_id in tier_field_ids.items():
+                if field_id:  # Only update fields we found
+                    field_updates[field_id] = (tier_name == target_tier_name)
             
-            # Update the commitment with the approval tier
-            success = self.update_commitment_custom_field(project_id, commitment_id, field_updates)
+            if not field_updates:
+                logger.error("❌ No valid tier fields found to update")
+                return False
+            
+            logger.info(f"🎯 Setting {target_tier_name} = True, others = False")
+            logger.info(f"🔧 Field updates: {field_updates}")
+            
+            # Update the commitment with the tier checkboxes
+            success = self.update_commitment_custom_field(project_id, commitment_id, field_updates, company_id)
             
             if success:
-                logger.info(f"✅ Updated Approval Tier to: {approval_value}")
+                logger.info(f"✅ Updated approval tiers - {target_tier_name} checked")
                 logger.info(f"📝 Reason: {reason}")
+                
+                # Verify the update by reading back the values
+                for tier_name, field_id in tier_field_ids.items():
+                    if field_id and tier_name == target_tier_name:
+                        verified_value = self.verify_custom_field_update(project_id, commitment_id, field_id)
+                        if verified_value:
+                            logger.info(f"🔍 Verification: {tier_name} field contains '{verified_value}'")
+                        else:
+                            logger.warning(f"⚠️ Could not verify {tier_name} update")
             else:
-                logger.error(f"❌ Failed to update Approval Tier custom field")
+                logger.error(f"❌ Failed to update tier custom fields")
             
             return success
             
@@ -312,43 +519,41 @@ class ApprovalEngine:
             logger.info(f"🧠 Processing approval logic for PO {po_id} in project {project_id}")
             
             # Step 1: Get PO details and amount
-            po_amount = self._get_po_amount(project_id, po_id)
+            po_amount = self._get_po_amount(project_id, po_id, company_id)
             if po_amount is None:
-                return ApprovalTier.MANAGING_DIRECTOR, "Could not retrieve PO amount"
+                return ApprovalTier.TIER_5, "Could not retrieve PO amount"
             
             # Step 2: Calculate revised budget
             revised_budget = self._calculate_revised_budget(company_id, project_id)
             if revised_budget is None:
-                return ApprovalTier.MANAGING_DIRECTOR, "Could not calculate revised budget"
+                return ApprovalTier.TIER_5, "Could not calculate revised budget"
             
-            # Step 3: Check if over budget
+            # Step 4: Check if over budget first (highest priority)
             if po_amount > revised_budget:
-                return ApprovalTier.MANAGING_DIRECTOR, f"PO amount ${po_amount:,.2f} exceeds revised budget ${revised_budget:,.2f}"
+                return ApprovalTier.TIER_5, f"PO amount ${po_amount:,.2f} exceeds revised budget ${revised_budget:,.2f}"
             
-            # Step 4: Base tier on PO amount
+            # Step 5: Check for unapproved change orders attached to this PO
+            if self._has_unapproved_change_orders(project_id, po_id):
+                return ApprovalTier.TIER_4, f"Unapproved change orders attached to PO ${po_amount:,.2f} (under budget)"
+            
+            # Step 6: Check Ad-Hoc custom field (cost code 99-999) - forces Tier 3
+            if self._is_ad_hoc_po(project_id, po_id, company_id):
+                return ApprovalTier.TIER_3, f"Ad-Hoc PO (99-999 cost code) ${po_amount:,.2f} (under budget)"
+            
+            # Step 7: Base tier on PO amount (all under budget, no COs, not Ad-Hoc)
             approval_tier = self._get_base_approval_tier(po_amount)
-            tier_reason = f"Base tier {approval_tier} for PO amount ${po_amount:,.2f}"
-            
-            # Step 5: Check for unapproved change orders
-            if self._has_unapproved_change_orders(project_id):
-                approval_tier = max(approval_tier, ApprovalTier.OPERATIONS_MANAGER)
-                tier_reason += " + unapproved COs present"
-            
-            # Step 6: Check Ad-Hoc custom field (cost code 99-999)
-            if self._is_ad_hoc_po(project_id, po_id):
-                approval_tier = max(approval_tier, ApprovalTier.PROJECT_DIRECTOR)
-                tier_reason += " + Ad-Hoc PO (99-999 cost code)"
+            tier_reason = f"Amount-based tier {approval_tier} for PO ${po_amount:,.2f} (under budget)"
             
             logger.info(f"✅ Approval tier {approval_tier}: {tier_reason}")
             return approval_tier, tier_reason
             
         except Exception as e:
             logger.error(f"❌ Error calculating approval tier: {e}")
-            return ApprovalTier.MANAGING_DIRECTOR, f"Error in approval calculation: {e}"
+            return ApprovalTier.TIER_5, f"Error in approval calculation: {e}"
     
-    def _get_po_amount(self, project_id: str, po_id: str) -> Optional[float]:
+    def _get_po_amount(self, project_id: str, po_id: str, company_id: str = None) -> Optional[float]:
         """Get total PO amount from line items"""
-        line_items = self.api.get_po_line_items(project_id, po_id)
+        line_items = self.api.get_po_line_items(project_id, po_id, company_id)
         if not line_items:
             return None
         
@@ -361,29 +566,83 @@ class ApprovalEngine:
         return total_amount
     
     def _calculate_revised_budget(self, company_id: str, project_id: str) -> Optional[float]:
-        """Calculate revised budget = original + approved changes + approved COs"""
+        """Calculate revised budget = original + approved changes + approved COs by WBS alignment"""
         try:
+            logger.info("💰 Calculating revised budget with WBS alignment...")
+            
             # Get approved budget changes
             budget_changes = self.api.get_budget_changes(company_id, project_id)
-            budget_change_amount = sum(
-                float(change.get('amount', 0) or 0)
-                for change in (budget_changes or [])
-            )
+            budget_change_amount = 0
+            budget_wbs_amounts = {}  # Track amounts by WBS ID
             
-            # Get approved change orders
+            if budget_changes and isinstance(budget_changes, list):
+                for change in budget_changes:
+                    if isinstance(change, dict):
+                        amount = float(change.get('amount', 0) or 0)
+                        wbs_id = change.get('wbs_id') or change.get('wbs_code_id')
+                        
+                        if wbs_id:
+                            budget_wbs_amounts[wbs_id] = budget_wbs_amounts.get(wbs_id, 0) + amount
+                        
+                        budget_change_amount += amount
+                        logger.info(f"📊 Budget change: ${amount:,.2f} (WBS: {wbs_id})")
+            
+            # Get approved change orders and their line items
             approved_cos = self.api.get_change_orders(project_id, status='approved')
-            co_amount = sum(
-                float(co.get('amount', 0) or 0)
-                for co in (approved_cos or [])
-            )
+            co_amount = 0
+            co_wbs_amounts = {}  # Track amounts by WBS ID
             
-            # For original budget, you might need to get project budget
-            # This is a simplified calculation - adjust based on your needs
-            original_budget = 1000000  # You'll need to get this from appropriate endpoint
+            if approved_cos and isinstance(approved_cos, list):
+                for co in approved_cos:
+                    if isinstance(co, dict):
+                        co_id = co.get('id')
+                        
+                        # Get line items for this change order to align by WBS
+                        co_line_items = self.api.get_commitment_change_order_line_items(company_id, project_id, co_id)
+                        
+                        if co_line_items and isinstance(co_line_items, list):
+                            for line_item in co_line_items:
+                                if isinstance(line_item, dict):
+                                    amount = float(line_item.get('amount', 0) or 0)
+                                    wbs_id = line_item.get('wbs_id') or line_item.get('wbs_code_id')
+                                    
+                                    if wbs_id:
+                                        co_wbs_amounts[wbs_id] = co_wbs_amounts.get(wbs_id, 0) + amount
+                                    
+                                    co_amount += amount
+                                    logger.info(f"📊 Change order line item: ${amount:,.2f} (WBS: {wbs_id}, CO: {co_id})")
+                        else:
+                            # Fallback to CO total amount if no line items
+                            amount = float(co.get('amount', 0) or 0)
+                            co_amount += amount
+                            logger.info(f"📊 Change order total: ${amount:,.2f} (CO: {co_id}, no line items)")
             
-            revised_budget = original_budget + budget_change_amount + co_amount
+            # Calculate WBS-aligned totals
+            all_wbs_ids = set(budget_wbs_amounts.keys()) | set(co_wbs_amounts.keys())
+            wbs_aligned_total = 0
             
-            logger.info(f"💰 Revised budget: ${original_budget:,.2f} + ${budget_change_amount:,.2f} + ${co_amount:,.2f} = ${revised_budget:,.2f}")
+            for wbs_id in all_wbs_ids:
+                budget_amt = budget_wbs_amounts.get(wbs_id, 0)
+                co_amt = co_wbs_amounts.get(wbs_id, 0)
+                wbs_total = budget_amt + co_amt
+                wbs_aligned_total += wbs_total
+                
+                if wbs_total != 0:
+                    logger.info(f"📋 WBS {wbs_id}: Budget changes ${budget_amt:,.2f} + CO changes ${co_amt:,.2f} = ${wbs_total:,.2f}")
+            
+            # For original budget, you might need to get project budget from appropriate endpoint
+            # This is a simplified calculation - you should replace with actual budget API call
+            original_budget = 1000000  # TODO: Get this from Procore budget API
+            
+            revised_budget = original_budget + wbs_aligned_total
+            
+            logger.info(f"💰 Revised budget calculation:")
+            logger.info(f"   Original budget: ${original_budget:,.2f}")
+            logger.info(f"   WBS-aligned changes: ${wbs_aligned_total:,.2f}")
+            logger.info(f"   Total budget changes: ${budget_change_amount:,.2f}")
+            logger.info(f"   Total CO changes: ${co_amount:,.2f}")
+            logger.info(f"   Final revised budget: ${revised_budget:,.2f}")
+            
             return revised_budget
             
         except Exception as e:
@@ -392,30 +651,44 @@ class ApprovalEngine:
     
     def _get_base_approval_tier(self, amount: float) -> int:
         """Get base approval tier based on PO amount"""
-        if amount <= 500000:
-            return ApprovalTier.AUTO_APPROVE
-        elif amount <= 1000000:
-            return ApprovalTier.PROJECT_MANAGER
+        if amount < 5000:
+            return ApprovalTier.TIER_1
+        elif amount <= 10000:
+            return ApprovalTier.TIER_2
         else:
-            return ApprovalTier.PROJECT_DIRECTOR
+            return ApprovalTier.TIER_3
     
-    def _has_unapproved_change_orders(self, project_id: str) -> bool:
-        """Check if project has unapproved change orders"""
-        unapproved_cos = self.api.get_change_orders(project_id, status='pending')
-        has_unapproved = bool(unapproved_cos and len(unapproved_cos) > 0)
+    def _has_unapproved_change_orders(self, project_id: str, po_id: str) -> bool:
+        """Check if PO has unapproved change orders attached"""
+        po_change_orders = self.api.get_po_change_orders(po_id)
+        
+        if not po_change_orders:
+            logger.info(f"ℹ️ No change orders found for PO {po_id}")
+            return False
+        
+        unapproved_count = 0
+        for co in po_change_orders:
+            status = co.get('status', 'unknown')
+            if status != 'approved':
+                unapproved_count += 1
+                logger.info(f"⚠️ Found unapproved change order {co.get('id')} with status: {status}")
+        
+        has_unapproved = unapproved_count > 0
         
         if has_unapproved:
-            logger.info(f"⚠️ Found {len(unapproved_cos)} unapproved change orders")
+            logger.info(f"⚠️ Found {unapproved_count} unapproved change orders attached to PO {po_id}")
+        else:
+            logger.info(f"✅ All change orders for PO {po_id} are approved")
         
         return has_unapproved
     
-    def _is_ad_hoc_po(self, project_id: str, po_id: str) -> bool:
+    def _is_ad_hoc_po(self, project_id: str, po_id: str, company_id: str = None) -> bool:
         """Check if PO is Ad-Hoc by examining cost codes on line items"""
         try:
             logger.info(f"🔍 Checking for Ad-Hoc cost codes on PO {po_id}")
             
             # Get PO line items to check cost codes
-            line_items = self.api.get_po_line_items(project_id, po_id)
+            line_items = self.api.get_po_line_items(project_id, po_id, company_id)
             if not line_items:
                 logger.warning(f"⚠️ No line items found for PO {po_id}")
                 return False
@@ -485,7 +758,38 @@ def oauth_callback():
     
     if api_client.authenticate(code):
         logger.info("✅ OAuth authentication successful")
-        return '✅ Authentication successful! Webhook processing is now active.', 200
+        
+        # LOG THE TOKEN DETAILS
+        logger.info("🔑 ========== TOKEN DETAILS ==========")
+        logger.info(f"🔑 ACCESS TOKEN: {api_client.access_token}")
+        logger.info(f"🔄 REFRESH TOKEN: {api_client.refresh_token}")
+        logger.info(f"⏰ EXPIRES AT: {api_client.token_expires_at}")
+        logger.info(f"🌍 ENVIRONMENT: {api_client.environment}")
+        logger.info("🔑 =====================================")
+        
+        # Also print to console for easy copying
+        print("\n" + "="*60)
+        print("🎉 PROCORE ACCESS TOKEN GENERATED")
+        print("="*60)
+        print(f"Access Token: {api_client.access_token}")
+        print(f"Refresh Token: {api_client.refresh_token}")
+        print(f"Expires At: {api_client.token_expires_at}")
+        print(f"Environment: {api_client.environment}")
+        print("\n📋 Environment Variables:")
+        print(f"export PROCORE_ACCESS_TOKEN='{api_client.access_token}'")
+        if api_client.refresh_token:
+            print(f"export PROCORE_REFRESH_TOKEN='{api_client.refresh_token}'")
+        if api_client.token_expires_at:
+            print(f"export PROCORE_TOKEN_EXPIRES_AT='{api_client.token_expires_at.isoformat()}'")
+        print("="*60)
+        
+        return '''
+        ✅ Authentication successful! 
+        
+        Check the application logs for your access token details.
+        
+        You can also copy the environment variables from the console output.
+        ''', 200
     else:
         return '❌ Authentication failed', 500
 
@@ -583,12 +887,13 @@ def handle_webhook():
             payload.company_id
         )
         
-        # Post approval decision back to Procore by updating custom field
+        # Post approval decision back to Procore by updating tier checkbox custom fields
         success = api_client.post_approval_decision(
-            payload.project_id,
-            po_id_to_process,  # Use the main PO ID, not line item ID
-            approval_tier,
-            reason
+            payload.project_id, 
+            po_id_to_process, 
+            approval_tier, 
+            reason, 
+            payload.company_id
         )
         
         if success:
