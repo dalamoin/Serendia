@@ -14,3 +14,7 @@ gcloud beta logging tail \
   'resource.type="cloud_run_revision" AND resource.labels.service_name="po-automation" AND (textPayload:"📋" OR textPayload:"🧠" OR textPayload:"📊" OR textPayload:"💡 Please create" OR textPayload:"✅ Updated" OR textPayload:"purchase_order_contract_line_items")' \
   --project=serendia
 
+# Access Token Retrieval
+
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=po-automation AND textPayload:TOKEN" --limit=10
+
