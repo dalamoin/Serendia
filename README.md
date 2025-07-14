@@ -16,5 +16,4 @@ gcloud beta logging tail \
 
 # Access Token Retrieval
 
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=po-automation AND textPayload:TOKEN" --limit=10
-
+curl -s https://po-automation-68642982777.us-central1.run.app/debug/token | python3 -m json.tool
