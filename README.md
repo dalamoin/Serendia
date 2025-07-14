@@ -17,3 +17,6 @@ gcloud beta logging tail \
 # Access Token Retrieval
 
 curl -s https://po-automation-68642982777.us-central1.run.app/debug/token | python3 -m json.tool
+
+# Check Logs
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=po-automation" --project=serendia --limit=15 --format="table(timestamp,severity,textPayload)" --freshness=2m
