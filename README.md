@@ -18,7 +18,5 @@ gcloud beta logging tail \
 
 curl -s https://po-automation-68642982777.us-central1.run.app/auth/status | python3 -m json.tool
 
-# If not authenticated, go to the OAuth URL shown in the response
-
 # Check Logs
 gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=po-automation" --project=serendia --limit=15 --format="table(timestamp,severity,textPayload)" --freshness=2m
