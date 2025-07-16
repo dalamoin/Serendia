@@ -471,7 +471,7 @@ class ApprovalEngine:
                 return ApprovalTier.TIER_3, reason
             
             # Tier 2 Conditions
-            if 5000 < grand_total < 10000:
+            if 5000 <= grand_total <= 10000:
                 reason = "Grand total between $5,000-$10,000"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_2_CONDITION_1_TRIGGERED")
                 return ApprovalTier.TIER_2, reason
