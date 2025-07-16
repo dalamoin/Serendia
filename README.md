@@ -1,20 +1,64 @@
-# Step 1: Get your credentials
+# Switch to correct project and directory
+gcloud config set project serendia
+cd ~/projects/serendia/po-automation
+source .env
+
+# Build new image with the fix
+TIMESTAMP=$(date +%s)
+echo "Building token refresh fix image: ${TIMESTAMP}"
+gcloud builds submit --config cloudbuild.yaml --substitutions=_TIMESTAMP=${TIMESTAMP} --project=serendia
+
+# Verify build completed
+gcloud container images list-tags us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation --limit=3
+
+# Use the newly built image
+LATEST_IMAGE_TAG=${TIMESTAMP}
+echo "Using image tag: ${LATEST_IMAGE_TAG}"
+
+# Deploy with the new image (no tokens yet)
+gcloud run deploy po-automation \
+  --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${LATEST_IMAGE_TAG} \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 512Mi \
+  --cpu 1 \
+  --timeout 300 \
+  --max-instances 10 \
+  --concurrency 80 \
+  --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},DEPLOY_TIME=${LATEST_IMAGE_TAG}" \
+  --project=serendia
+
+# Authenticate
+
+echo "Visit this URL to authenticate:"
+echo "https://sandbox.procore.com/oauth/authorize?client_id=${PROCORE_CLIENT_ID}&response_type=code&redirect_uri=https://po-automation-68642982777.us-central1.run.app/oauth/callback"
+
+# Get Fresh Tokens
 
 curl -s https://po-automation-68642982777.us-central1.run.app/auth/status | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 if data.get('status') == 'authenticated':
-    print('ACCESS_TOKEN:', data.get('full_token'))
-    print('REFRESH_TOKEN:', data.get('refresh_token'))
+    print('✅ Authentication successful!')
     print()
-    print('COPY THESE FOR DEPLOYMENT:')
-    print('PROCORE_ACCESS_TOKEN=' + data.get('full_token', ''))
-    print('PROCORE_REFRESH_TOKEN=' + data.get('refresh_token', ''))
+    print('ACCESS_TOKEN=' + data.get('full_token', ''))
+    print('REFRESH_TOKEN=' + data.get('refresh_token', ''))
 else:
-    print('Not authenticated!')
+    print('❌ Status:', data.get('status'))
+    if 'oauth_url' in data:
+        print('OAuth URL:', data['oauth_url'])
 "
-# Step 2: Deploy Application
 
-source .env && TIMESTAMP=$(date +%s) && echo "Persistent tokens deployment: ${TIMESTAMP}" && gcloud builds submit --config cloudbuild.yaml --substitutions=_TIMESTAMP=${TIMESTAMP} --project=serendia && gcloud run deploy po-automation --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${TIMESTAMP} --platform managed --region us-central1 --allow-unauthenticated --memory 512Mi --cpu 1 --timeout 300 --max-instances 10 --concurrency 80 --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},PROCORE_ACCESS_TOKEN=PASTE_YOUR_ACCESS_TOKEN_HERE,PROCORE_REFRESH_TOKEN=PASTE_YOUR_REFRESH_TOKEN_HERE,DEPLOY_TIME=${TIMESTAMP}" --project=serendia
-
---Replace PASTE_YOUR_ACCESS_TOKEN_HERE and PASTE_YOUR_REFRESH_TOKEN_HERE with the actual tokens from Step 1.--
+# Replace YOUR_ACCESS_TOKEN and YOUR_REFRESH_TOKEN with actual values
+gcloud run deploy po-automation \
+  --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${LATEST_IMAGE_TAG} \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 512Mi \
+  --cpu 1 \
+  --timeout 300 \
+  --max-instances 10 \
+  --concurrency 80 \
+  --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},PROCORE_ACCESS_TOKEN=YOUR_ACCESS_TOKEN,PROCORE_REFRESH_TOKEN=YOUR_REFRESH_TOKEN,DEPLOY_TIME=${LATEST_IMAGE_TAG}" --project=serendia
