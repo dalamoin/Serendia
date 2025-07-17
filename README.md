@@ -3,9 +3,9 @@
 # Switch to correct project and directory
 gcloud config set project serendia
 cd ~/projects/serendia/po-automation
-source .env
 
 #Build new image with the fix
+source .env
 TIMESTAMP=$(date +%s)
 echo "Building token refresh fix image: ${TIMESTAMP}"
 gcloud builds submit --config cloudbuild.yaml --substitutions=_TIMESTAMP=${TIMESTAMP} --project=serendia
@@ -31,7 +31,7 @@ gcloud run deploy po-automation \
   --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},DEPLOY_TIME=${LATEST_IMAGE_TAG}" \
   --project=serendia
 
-# Step 2: Authetnicate
+# Step 2: Authenticate
 
 #Authenticate
 
