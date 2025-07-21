@@ -27,21 +27,21 @@ PROCORE_ENVIRONMENT = os.environ.get('PROCORE_ENVIRONMENT', 'sandbox')
 
 # Custom Field IDs for Tier checkboxes
 TIER_FIELD_IDS = {
-    'Tier 1': '4334',
-    'Tier 2': '4335',
-    'Tier 3': '4336',
-    'Tier 4': '4337',
-    'Tier 5': '4338'
+    'Auto-Approve': '4334',
+    'Tier 1': '4335',
+    'Tier 2': '4336',
+    'Tier 3': '4337',
+    'Tier 4': '4338'
 }
 
 @dataclass
 class ApprovalTier:
     """Approval tier definitions"""
-    TIER_1 = 1
-    TIER_2 = 2
-    TIER_3 = 3
-    TIER_4 = 4
-    TIER_5 = 5
+    AUTO_APPROVE = "Auto-Approve"
+    TIER_1 = "Tier 1"
+    TIER_2 = "Tier 2"
+    TIER_3 = "Tier 3"
+    TIER_4 = "Tier 4"
 
 @dataclass
 class ProcoreWebhookPayload:
@@ -299,7 +299,7 @@ class ProcoreAPIClient:
             logger.error(f"Failed to get budget detail rows: {e}")
             return None
     
-    def update_po_tiers(self, resource_id: str, project_id: str, company_id: str, tier: int) -> bool:
+    def update_po_tiers(self, resource_id: str, project_id: str, company_id: str, tier: str) -> bool:
         """Update PO with tier checkboxes"""
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}"
         headers = {
@@ -312,8 +312,7 @@ class ProcoreAPIClient:
         # Set only the target tier to true, others to false
         custom_fields = {}
         for tier_name, field_id in TIER_FIELD_IDS.items():
-            tier_num = int(tier_name.split()[1])
-            custom_fields[f"custom_field_{field_id}"] = 'true' if tier_num == tier else 'false'
+            custom_fields[f"custom_field_{field_id}"] = 'true' if tier_name == tier else 'false'
         
         payload = {
             "project_id": int(project_id),
@@ -321,15 +320,95 @@ class ProcoreAPIClient:
         }
         
         try:
-            logger.info(f"Updating PO {resource_id} with Tier {tier}")
+            logger.info(f"Updating PO {resource_id} with {tier}")
             response = self._make_authenticated_request('PATCH', url, headers=headers, params=params, json=payload)
             response.raise_for_status()
             
-            logger.info(f"Updated PO {resource_id} to Tier {tier}")
+            logger.info(f"Updated PO {resource_id} to {tier}")
             return True
             
         except Exception as e:
             logger.error(f"Failed to update PO {resource_id}: {e}")
+            return False
+
+    def add_po_log(self, resource_id: str, project_id: str, company_id: str, 
+                   tier: str, reason: str, webhook_timestamp: str,
+                   po_data: Dict = None, budget_analysis: Dict = None,
+                   has_potential_change_orders: bool = False, 
+                   unallocated_cost_present: bool = False) -> bool:
+        """Add justification log to PO after tier assignment"""
+        url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}"
+        headers = {
+            'Procore-Company-Id': str(company_id),
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        params = {'run_configurable_validations': 'true'}
+        
+        try:
+            # Convert webhook timestamp to Australian Eastern Time
+            from datetime import datetime, timezone, timedelta
+            utc_time = datetime.fromisoformat(webhook_timestamp.replace('Z', '+00:00'))
+            # AEST is UTC+10 (or UTC+11 during daylight saving)
+            aest_time = utc_time.astimezone(timezone(timedelta(hours=10)))
+            timestamp_str = aest_time.strftime('%Y-%m-%d %H:%M:%S AEST')
+            
+            # Get PO amount
+            grand_total = float(po_data.get('grand_total', 0) or 0) if po_data else 0.0
+            
+            # Build justification log with proper line breaks
+            log_lines = [
+                f"Outcome: {tier}",
+                f"Timestamp: {timestamp_str}",
+                "Justification:",
+                f"- PO Amount: ${grand_total:,.2f}",
+                f"- Has Potential Change Orders: {'✅ Yes' if has_potential_change_orders else '❌ No'}",
+                f"- Unallocated Cost Present: {'✅ Yes' if unallocated_cost_present else '❌ No'}"
+            ]
+            
+            # Add budget analysis details
+            if budget_analysis and budget_analysis.get('budget_analysis'):
+                log_lines.append("- Budget Analysis:")
+                for budget_item in budget_analysis['budget_analysis']:
+                    wbs_description = budget_item.get('wbs_description', 'Unknown')
+                    sum_wbs_code_line_items = budget_item.get('sum_wbs_code_line_items', 0)
+                    committed_costs = budget_item.get('committed_costs', 0)
+                    revised_budget = budget_item.get('revised_budget', 0)
+                    future_committed_costs = budget_item.get('future_committed_costs', 0)
+                    is_overbudget = budget_item.get('is_overbudget', False)
+                    
+                    status_emoji = "❌ OVER BUDGET" if is_overbudget else "✅ Within Budget"
+                    log_lines.append(f"  {wbs_description}: ${committed_costs:,.2f} committed + ${sum_wbs_code_line_items:,.2f} PO = ${future_committed_costs:,.2f} vs ${revised_budget:,.2f} revised budget ({status_emoji})")
+            
+            # Add tier-specific reasoning
+            log_lines.append(f"- Decision: {reason}")
+            
+            # If error case, add error details
+            if tier == ApprovalTier.TIER_4 and "error" in reason.lower():
+                log_lines.append("- Note: Assigned highest tier for safety due to processing error")
+            
+            # Join all lines with newline characters
+            justification_text = "\n".join(log_lines)
+            
+            # Use simple string format (not rich_text object)
+            payload = {
+                "project_id": int(project_id),
+                "purchase_order_contract": {
+                    "custom_field_4367": justification_text
+                }
+            }
+            
+            logger.info(f"Adding justification log to PO {resource_id}")
+            logger.info(f"Justification content preview: {justification_text[:100]}...")
+            
+            response = self._make_authenticated_request('PATCH', url, headers=headers, params=params, json=payload)
+            response.raise_for_status()
+            
+            logger.info(f"Successfully added justification log to PO {resource_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to add log to PO {resource_id}: {e}")
             return False
     
     def test_token_refresh(self) -> Dict[str, any]:
@@ -391,7 +470,7 @@ class ApprovalEngine:
     def __init__(self, api_client: ProcoreAPIClient):
         self.api = api_client
     
-    def calculate_approval_tier(self, project_id: str, resource_id: str, company_id: str) -> Tuple[int, str]:
+    def calculate_approval_tier(self, project_id: str, resource_id: str, company_id: str, webhook_timestamp: str = None) -> Tuple[str, str]:
         """Calculate approval tier using updated business logic"""
         try:
             logger.info(f"Processing approval logic for PO {resource_id}")
@@ -405,7 +484,12 @@ class ApprovalEngine:
             po_data = self.api.get_purchase_order_by_id(resource_id, project_id, company_id)
             if not po_data:
                 logger.error(f"Could not retrieve PO {resource_id}")
-                return ApprovalTier.TIER_5, f"Could not retrieve PO {resource_id}"
+                # For error cases, still add log
+                error_reason = f"Could not retrieve PO {resource_id}"
+                if webhook_timestamp:
+                    self.api.add_po_log(resource_id, project_id, company_id, 
+                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp)
+                return ApprovalTier.TIER_4, error_reason
             
             grand_total = float(po_data.get('grand_total', 0) or 0)
             has_potential_change_orders = bool(po_data.get('has_potential_change_orders', False))
@@ -417,7 +501,12 @@ class ApprovalEngine:
             line_items = self.api.get_po_line_items(resource_id, project_id, company_id)
             if not line_items:
                 logger.error(f"Could not retrieve line items for PO {resource_id}")
-                return ApprovalTier.TIER_5, f"Could not retrieve line items for PO {resource_id}"
+                error_reason = f"Could not retrieve line items for PO {resource_id}"
+                if webhook_timestamp:
+                    self.api.add_po_log(resource_id, project_id, company_id, 
+                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                      po_data=po_data)
+                return ApprovalTier.TIER_4, error_reason
             
             # Process line items and group by wbs_code
             line_items_by_wbs = defaultdict(list)
@@ -453,7 +542,14 @@ class ApprovalEngine:
             budget_views = self.api.get_budget_views(project_id, company_id)
             if not budget_views:
                 logger.error("Could not get budget views")
-                return ApprovalTier.TIER_5, "Could not get budget views"
+                error_reason = "Could not get budget views"
+                if webhook_timestamp:
+                    self.api.add_po_log(resource_id, project_id, company_id, 
+                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                      po_data=po_data, 
+                                      has_potential_change_orders=has_potential_change_orders,
+                                      unallocated_cost_present=unallocated_cost_present)
+                return ApprovalTier.TIER_4, error_reason
             
             budget_view_id = budget_views[0]['id']
             logger.info(f"budget_view_id: {budget_view_id}")
@@ -463,7 +559,14 @@ class ApprovalEngine:
             budget_rows = self.api.get_budget_detail_rows(budget_view_id, project_id, company_id)
             if not budget_rows:
                 logger.error("Could not get budget detail rows")
-                return ApprovalTier.TIER_5, "Could not get budget detail rows"
+                error_reason = "Could not get budget detail rows"
+                if webhook_timestamp:
+                    self.api.add_po_log(resource_id, project_id, company_id, 
+                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                      po_data=po_data,
+                                      has_potential_change_orders=has_potential_change_orders,
+                                      unallocated_cost_present=unallocated_cost_present)
+                return ApprovalTier.TIER_4, error_reason
             
             # Create budget lookup by wbs_code
             budget_by_wbs = {}
@@ -486,6 +589,7 @@ class ApprovalEngine:
             logger.info("=== STEP 7: Over-Budget Analysis ===")
             is_any_overbudget = False
             overbudget_details = []
+            budget_analysis_data = []
             
             for wbs_key, line_items_list in line_items_by_wbs.items():
                 # Sum all line items with same wbs_code
@@ -499,13 +603,31 @@ class ApprovalEngine:
                 budget_data = budget_by_wbs.get(wbs_key)
                 if not budget_data:
                     logger.error(f"No matching budget row found for wbs_code: {wbs_key}")
-                    return ApprovalTier.TIER_5, f"No matching budget row found for wbs_code: {wbs_key}"
+                    error_reason = f"No matching budget row found for wbs_code: {wbs_key}"
+                    if webhook_timestamp:
+                        self.api.add_po_log(resource_id, project_id, company_id, 
+                                          ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                          po_data=po_data,
+                                          has_potential_change_orders=has_potential_change_orders,
+                                          unallocated_cost_present=unallocated_cost_present)
+                    return ApprovalTier.TIER_4, error_reason
                 
                 # Calculate future committed costs
                 revised_budget = budget_data['revised_budget']
                 committed_costs = budget_data['committed_costs']
                 future_committed_costs = committed_costs + total_po_amount
                 is_overbudget = future_committed_costs > revised_budget
+                
+                # Store budget analysis data for logging
+                budget_analysis_data.append({
+                    'wbs_code': wbs_key,
+                    'wbs_description': wbs_description,
+                    'sum_wbs_code_line_items': total_po_amount,
+                    'committed_costs': committed_costs,
+                    'revised_budget': revised_budget,
+                    'future_committed_costs': future_committed_costs,
+                    'is_overbudget': is_overbudget
+                })
                 
                 if is_overbudget:
                     is_any_overbudget = True
@@ -514,51 +636,65 @@ class ApprovalEngine:
                 else:
                     logger.info(f"wbs_code {wbs_description} isn't over budget. CALCULATION: is_overbudget = false")
             
+            # Prepare budget analysis for logging
+            budget_analysis = {'budget_analysis': budget_analysis_data}
+            
             # Step 8: Business Logic - Tier Assignment
             logger.info("=== BUSINESS_LOGIC: APPROVAL_TIER_CALCULATION ===")
             
-            # Tier 5 Conditions (Highest Priority)
+            tier = None
+            reason = None
+            
+            # Tier 4 Conditions (Highest Priority) - Old Tier 5
             if is_any_overbudget:
+                tier = ApprovalTier.TIER_4
                 reason = f"Over budget on wbs_code level: {'; '.join(overbudget_details)}"
-                logger.info("BUSINESS_LOGIC_DECISION: TIER_5_CONDITION_1_TRIGGERED: is_over_budget=True")
-                return ApprovalTier.TIER_5, reason
-            
-            if has_potential_change_orders and unallocated_cost_present:
+                logger.info("BUSINESS_LOGIC_DECISION: TIER_4_CONDITION_1_TRIGGERED: is_over_budget=True")
+            elif has_potential_change_orders and unallocated_cost_present:
+                tier = ApprovalTier.TIER_4
                 reason = "Has Potential Change Order and Unallocated Cost"
-                logger.info("BUSINESS_LOGIC_DECISION: TIER_5_CONDITION_2_TRIGGERED")
-                return ApprovalTier.TIER_5, reason
-            
-            # Tier 4 Conditions
-            if has_potential_change_orders:
+                logger.info("BUSINESS_LOGIC_DECISION: TIER_4_CONDITION_2_TRIGGERED")
+            # Tier 3 Conditions - Old Tier 4
+            elif has_potential_change_orders:
+                tier = ApprovalTier.TIER_3
                 reason = "Has potential change order=true"
-                logger.info("BUSINESS_LOGIC_DECISION: TIER_4_CONDITION_1_TRIGGERED")
-                return ApprovalTier.TIER_4, reason
-            
-            # Tier 3 Conditions
-            if unallocated_cost_present:
-                reason = "Unallocated cost code"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_3_CONDITION_1_TRIGGERED")
-                return ApprovalTier.TIER_3, reason
-            
-            if grand_total > 10000:
-                reason = "Grand total > $10,000"
-                logger.info("BUSINESS_LOGIC_DECISION: TIER_3_CONDITION_2_TRIGGERED")
-                return ApprovalTier.TIER_3, reason
-            
-            # Tier 2 Conditions
-            if 5000 <= grand_total <= 10000:
-                reason = "Grand total between $5,000-$10,000"
+            # Tier 2 Conditions - Old Tier 3
+            elif unallocated_cost_present:
+                tier = ApprovalTier.TIER_2
+                reason = "Unallocated cost code"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_2_CONDITION_1_TRIGGERED")
-                return ApprovalTier.TIER_2, reason
+            elif grand_total > 10000:
+                tier = ApprovalTier.TIER_2
+                reason = "Grand total > $10,000"
+                logger.info("BUSINESS_LOGIC_DECISION: TIER_2_CONDITION_2_TRIGGERED")
+            # Tier 1 Conditions - Old Tier 2
+            elif 5000 <= grand_total <= 10000:
+                tier = ApprovalTier.TIER_1
+                reason = "Grand total between $5,000-$10,000"
+                logger.info("BUSINESS_LOGIC_DECISION: TIER_1_CONDITION_1_TRIGGERED")
+            # Auto-Approve (Default) - Old Tier 1
+            else:
+                tier = ApprovalTier.AUTO_APPROVE
+                reason = "Grand total < $5,000"
+                logger.info("BUSINESS_LOGIC_DECISION: AUTO_APPROVE_DEFAULT_TRIGGERED")
             
-            # Tier 1 (Default)
-            reason = "Grand total < $5,000"
-            logger.info("BUSINESS_LOGIC_DECISION: TIER_1_DEFAULT_TRIGGERED")
-            return ApprovalTier.TIER_1, reason
+            # Add justification log if webhook timestamp is provided
+            if webhook_timestamp:
+                self.api.add_po_log(resource_id, project_id, company_id, tier, reason, webhook_timestamp,
+                                  po_data=po_data, budget_analysis=budget_analysis,
+                                  has_potential_change_orders=has_potential_change_orders,
+                                  unallocated_cost_present=unallocated_cost_present)
+            
+            return tier, reason
             
         except Exception as e:
             logger.error(f"Error calculating approval tier: {e}")
-            return ApprovalTier.TIER_5, f"Error in calculation: {e}"
+            error_reason = f"Error in calculation: {e}"
+            if webhook_timestamp:
+                self.api.add_po_log(resource_id, project_id, company_id, 
+                                  ApprovalTier.TIER_4, error_reason, webhook_timestamp)
+            return ApprovalTier.TIER_4, error_reason
     
     def _get_wbs_key(self, wbs_code: Dict) -> Optional[str]:
         """Get wbs_code key for matching with priority: id -> flat_code -> description"""
@@ -763,11 +899,12 @@ def handle_webhook():
         
         # Process approval tier calculation
         try:
-            # Calculate approval tier
+            # Calculate approval tier (now includes logging)
             approval_tier, reason = approval_engine.calculate_approval_tier(
                 payload.project_id, 
                 po_id, 
-                payload.company_id
+                payload.company_id,
+                payload.timestamp  # Pass webhook timestamp for logging
             )
             
             # Update PO with tier
