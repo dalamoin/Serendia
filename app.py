@@ -58,7 +58,7 @@ class ProcoreWebhookPayload:
     data: Optional[Dict] = None
 
 class ProcoreAPIClient:
-    """Procore API client with OAuth 2.0 authentication and environment variable support"""
+    """Procore API client with OAuth 2.0 authentication and automatic token refresh"""
     
     def __init__(self):
         self.access_token = os.environ.get('PROCORE_ACCESS_TOKEN')
@@ -74,9 +74,18 @@ class ProcoreAPIClient:
             self.oauth_base = 'https://sandbox.procore.com'
             self.api_base = 'https://sandbox.procore.com'
         
-        # If we have a token from environment, log it
+        # If we have a token from environment, set expiration to trigger refresh checks
         if self.access_token:
             logger.info(f"Loaded access token from environment variable (length: {len(self.access_token)})")
+            # Set a conservative expiration time to trigger refresh validation
+            # This ensures the system will check token validity and refresh if needed
+            self.token_expires_at = datetime.now() + timedelta(minutes=5)
+            logger.info(f"Set token expiration trigger to: {self.token_expires_at.isoformat()}")
+            logger.info(f"ENV_ACCESS_TOKEN: {self.access_token}")
+        
+        if self.refresh_token:
+            logger.info(f"Loaded refresh token from environment variable (length: {len(self.refresh_token)})")
+            logger.info(f"ENV_REFRESH_TOKEN: {self.refresh_token}")
     
     def authenticate(self, authorization_code: str = None):
         """Authenticate using OAuth 2.0"""
@@ -109,6 +118,7 @@ class ProcoreAPIClient:
             
             logger.info(f"NEW_ACCESS_TOKEN: {self.access_token}")
             logger.info(f"NEW_REFRESH_TOKEN: {self.refresh_token}")
+            logger.info(f"Token expires at: {self.token_expires_at.isoformat()}")
             logger.info(f"Successfully authenticated with Procore {self.environment}")
             logger.info(f"DEPLOY_COMMAND: Add these to your next deployment:")
             logger.info(f"--set-env-vars='PROCORE_ACCESS_TOKEN={self.access_token},PROCORE_REFRESH_TOKEN={self.refresh_token}'")
@@ -120,7 +130,7 @@ class ProcoreAPIClient:
             return False
     
     def _refresh_access_token(self) -> bool:
-        """Refresh the access token"""
+        """Refresh the access token using refresh token"""
         if not self.refresh_token:
             logger.error("No refresh token available")
             return False
@@ -134,44 +144,76 @@ class ProcoreAPIClient:
         }
         
         try:
+            logger.info("Attempting to refresh access token")
             response = requests.post(url, data=data)
-            response.raise_for_status()
-            token_data = response.json()
             
-            self.access_token = token_data['access_token']
-            self.refresh_token = token_data.get('refresh_token', self.refresh_token)
-            expires_in = token_data.get('expires_in', 7200)
-            self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
-            
-            logger.info(f"REFRESHED_ACCESS_TOKEN: {self.access_token}")
-            logger.info(f"REFRESHED_REFRESH_TOKEN: {self.refresh_token}")
-            logger.info("Successfully refreshed access token")
-            
-            return True
+            if response.status_code == 200:
+                token_data = response.json()
+                
+                self.access_token = token_data['access_token']
+                self.refresh_token = token_data.get('refresh_token', self.refresh_token)
+                expires_in = token_data.get('expires_in', 7200)
+                self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+                
+                logger.info(f"Token refreshed successfully. New token expires at: {self.token_expires_at.isoformat()}")
+                logger.info(f"REFRESHED_ACCESS_TOKEN: {self.access_token}")
+                logger.info(f"REFRESHED_REFRESH_TOKEN: {self.refresh_token}")
+                logger.info("✅ Automatic token refresh successful")
+                
+                return True
+            else:
+                logger.error(f"Token refresh failed: {response.status_code} - {response.text}")
+                return False
             
         except Exception as e:
-            logger.error(f"Token refresh failed: {e}")
+            logger.error(f"Error refreshing token: {str(e)}")
             return False
     
     def _ensure_valid_token(self) -> bool:
-        """Ensure we have a valid access token"""
+        """Ensure we have a valid access token, refreshing if necessary"""
         if not self.access_token:
+            logger.error("No access token available")
             return False
             
+        # Check if token is expired or about to expire
         if self.token_expires_at and datetime.now() >= self.token_expires_at:
-            return self._refresh_access_token()
-            
+            logger.info("Access token is expired, attempting to refresh")
+            if self.refresh_token:
+                return self._refresh_access_token()
+            else:
+                logger.error("No refresh token available for token refresh")
+                return False
+        
         return True
+    
+    def _make_authenticated_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Make an authenticated request with automatic token refresh"""
+        if not self._ensure_valid_token():
+            raise Exception("Unable to obtain valid access token")
+        
+        headers = kwargs.get('headers', {})
+        headers['Authorization'] = f'Bearer {self.access_token}'
+        kwargs['headers'] = headers
+        
+        response = requests.request(method, url, **kwargs)
+        
+        # Handle 401 (token expired) with automatic refresh
+        if response.status_code == 401:
+            logger.warning("Received 401 Unauthorized, attempting token refresh")
+            if self._refresh_access_token():
+                # Retry request with new token
+                headers['Authorization'] = f'Bearer {self.access_token}'
+                response = requests.request(method, url, **kwargs)
+                logger.info("Request retried successfully after token refresh")
+            else:
+                logger.error("Token refresh failed, request cannot be retried")
+        
+        return response
     
     def get_purchase_order_by_id(self, resource_id: str, project_id: str, company_id: str) -> Optional[Dict]:
         """Get specific PO using filters"""
-        if not self._ensure_valid_token():
-            logger.error("Cannot make request: no valid token")
-            return None
-            
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts"
         headers = {
-            'Authorization': f'Bearer {self.access_token}',
             'Procore-Company-Id': str(company_id),
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -183,7 +225,7 @@ class ProcoreAPIClient:
         
         try:
             logger.info(f"Getting PO {resource_id} for project {project_id}")
-            response = requests.get(url, headers=headers, params=params)
+            response = self._make_authenticated_request('GET', url, headers=headers, params=params)
             response.raise_for_status()
             po_data = response.json()
             
@@ -199,13 +241,8 @@ class ProcoreAPIClient:
     
     def get_po_line_items(self, resource_id: str, project_id: str, company_id: str) -> Optional[List[Dict]]:
         """Get PO line items"""
-        if not self._ensure_valid_token():
-            logger.error("Cannot make request: no valid token")
-            return None
-            
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}/line_items"
         headers = {
-            'Authorization': f'Bearer {self.access_token}',
             'Procore-Company-Id': str(company_id),
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -214,7 +251,7 @@ class ProcoreAPIClient:
         
         try:
             logger.info(f"Getting line items for PO {resource_id}")
-            response = requests.get(url, headers=headers, params=params)
+            response = self._make_authenticated_request('GET', url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
             
@@ -224,13 +261,8 @@ class ProcoreAPIClient:
     
     def get_budget_views(self, project_id: str, company_id: str) -> Optional[List[Dict]]:
         """Get budget views"""
-        if not self._ensure_valid_token():
-            logger.error("Cannot make request: no valid token")
-            return None
-            
         url = f"{self.api_base}/rest/v1.0/budget_views"
         headers = {
-            'Authorization': f'Bearer {self.access_token}',
             'Procore-Company-Id': str(company_id),
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -239,7 +271,7 @@ class ProcoreAPIClient:
         
         try:
             logger.info(f"Getting budget views for project {project_id}")
-            response = requests.get(url, headers=headers, params=params)
+            response = self._make_authenticated_request('GET', url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
             
@@ -249,13 +281,8 @@ class ProcoreAPIClient:
     
     def get_budget_detail_rows(self, budget_view_id: str, project_id: str, company_id: str) -> Optional[List[Dict]]:
         """Get budget detail rows"""
-        if not self._ensure_valid_token():
-            logger.error("Cannot make request: no valid token")
-            return None
-            
         url = f"{self.api_base}/rest/v1.0/budget_views/{budget_view_id}/detail_rows"
         headers = {
-            'Authorization': f'Bearer {self.access_token}',
             'Procore-Company-Id': str(company_id),
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -264,7 +291,7 @@ class ProcoreAPIClient:
         
         try:
             logger.info(f"Getting budget detail rows for view {budget_view_id}")
-            response = requests.get(url, headers=headers, params=params)
+            response = self._make_authenticated_request('GET', url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
             
@@ -274,13 +301,8 @@ class ProcoreAPIClient:
     
     def update_po_tiers(self, resource_id: str, project_id: str, company_id: str, tier: int) -> bool:
         """Update PO with tier checkboxes"""
-        if not self._ensure_valid_token():
-            logger.error("Cannot make request: no valid token")
-            return False
-            
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}"
         headers = {
-            'Authorization': f'Bearer {self.access_token}',
             'Procore-Company-Id': str(company_id),
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -300,7 +322,7 @@ class ProcoreAPIClient:
         
         try:
             logger.info(f"Updating PO {resource_id} with Tier {tier}")
-            response = requests.patch(url, headers=headers, params=params, json=payload)
+            response = self._make_authenticated_request('PATCH', url, headers=headers, params=params, json=payload)
             response.raise_for_status()
             
             logger.info(f"Updated PO {resource_id} to Tier {tier}")
@@ -309,6 +331,59 @@ class ProcoreAPIClient:
         except Exception as e:
             logger.error(f"Failed to update PO {resource_id}: {e}")
             return False
+    
+    def test_token_refresh(self) -> Dict[str, any]:
+        """Test method to check token refresh functionality"""
+        try:
+            logger.info("🧪 TESTING: Token refresh functionality")
+            
+            # Store original values
+            original_expires_at = self.token_expires_at
+            original_access_token = self.access_token
+            
+            # Force token expiration for testing
+            logger.info("🧪 TESTING: Forcing token expiration")
+            self.token_expires_at = datetime.now() - timedelta(minutes=1)
+            
+            # Test _ensure_valid_token (should trigger refresh)
+            logger.info("🧪 TESTING: Calling _ensure_valid_token (should trigger refresh)")
+            refresh_result = self._ensure_valid_token()
+            
+            if refresh_result:
+                new_expires_at = self.token_expires_at
+                new_access_token = self.access_token
+                
+                # Test if token actually changed
+                token_changed = new_access_token != original_access_token
+                expiration_updated = new_expires_at != original_expires_at
+                
+                logger.info(f"🧪 TESTING: Token refresh test completed")
+                logger.info(f"🧪 TESTING: Refresh successful: {refresh_result}")
+                logger.info(f"🧪 TESTING: Token changed: {token_changed}")
+                logger.info(f"🧪 TESTING: Expiration updated: {expiration_updated}")
+                
+                return {
+                    'refresh_successful': refresh_result,
+                    'token_changed': token_changed,
+                    'expiration_updated': expiration_updated,
+                    'new_expires_at': new_expires_at.isoformat() if new_expires_at else None,
+                    'original_expires_at': original_expires_at.isoformat() if original_expires_at else None
+                }
+            else:
+                logger.error("🧪 TESTING: Token refresh failed")
+                # Restore original expiration if refresh failed
+                self.token_expires_at = original_expires_at
+                return {
+                    'refresh_successful': False,
+                    'error': 'Token refresh failed'
+                }
+                
+        except Exception as e:
+            logger.error(f"🧪 TESTING: Token refresh test error: {str(e)}")
+            return {
+                'refresh_successful': False,
+                'error': str(e)
+            }
 
 class ApprovalEngine:
     """Business logic for approval tiers"""
@@ -575,6 +650,61 @@ def auth_status():
             }), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/test/token-refresh', methods=['GET'])
+def test_token_refresh():
+    """Test endpoint for token refresh functionality"""
+    try:
+        logger.info("🧪 TEST ENDPOINT: Token refresh test requested")
+        result = api_client.test_token_refresh()
+        return jsonify({
+            'test_name': 'token_refresh_test',
+            'timestamp': datetime.now().isoformat(),
+            'result': result
+        }), 200
+    except Exception as e:
+        logger.error(f"🧪 TEST ENDPOINT: Error in token refresh test: {str(e)}")
+        return jsonify({
+            'test_name': 'token_refresh_test',
+            'timestamp': datetime.now().isoformat(),
+            'error': str(e)
+        }), 500
+
+@app.route('/test/api-call', methods=['GET'])
+def test_api_call():
+    """Test endpoint to make an API call and check if token refresh works"""
+    try:
+        logger.info("🧪 TEST ENDPOINT: API call test requested")
+        
+        # Try to make a simple API call that will trigger token validation
+        project_id = request.args.get('project_id', '270670')
+        company_id = request.args.get('company_id', '4264580')
+        
+        budget_views = api_client.get_budget_views(project_id, company_id)
+        
+        if budget_views is not None:
+            return jsonify({
+                'test_name': 'api_call_test',
+                'timestamp': datetime.now().isoformat(),
+                'success': True,
+                'budget_views_count': len(budget_views),
+                'token_expires_at': api_client.token_expires_at.isoformat() if api_client.token_expires_at else None
+            }), 200
+        else:
+            return jsonify({
+                'test_name': 'api_call_test',
+                'timestamp': datetime.now().isoformat(),
+                'success': False,
+                'error': 'API call returned None'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"🧪 TEST ENDPOINT: Error in API call test: {str(e)}")
+        return jsonify({
+            'test_name': 'api_call_test',
+            'timestamp': datetime.now().isoformat(),
+            'error': str(e)
+        }), 500
 
 @app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
