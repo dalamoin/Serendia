@@ -60,4 +60,5 @@ else:
 
 #Replace YOUR_ACCESS_TOKEN and YOUR_REFRESH_TOKEN with actual values
 
-gcloud run deploy po-automation --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${LATEST_IMAGE_TAG} --platform managed --region us-central1 --allow-unauthenticated --memory 512Mi --cpu 1 --timeout 300 --max-instances 10 --concurrency 80 --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},PROCORE_ACCESS_TOKEN=YOUR_ACCESS_TOKEN_HERE,PROCORE_REFRESH_TOKEN=YOUR_REFRESH_TOKEN_HERE,DEPLOY_TIME=${LATEST_IMAGE_TAG}" --project=serendia
+gcloud run deploy po-automation --image us-central1-docker.pkg.dev/serendia/po-automation-repo/po-automation:${TIMESTAMP} --platform managed --region us-central1 --allow-unauthenticated --memory 512Mi --cpu 1 --timeout 300 --max-instances 10 --concurrency 80 --set-env-vars="PROCORE_CLIENT_ID=${PROCORE_CLIENT_ID},PROCORE_CLIENT_SECRET=${PROCORE_CLIENT_SECRET},PROCORE_REDIRECT_URI=${PROCORE_REDIRECT_URI},PROCORE_ENVIRONMENT=${PROCORE_ENVIRONMENT},PROCORE_ACCESS_TOKEN={**YOUR_TOKEN_HERE**},PROCORE_REFRESH_TOKEN={**REFRESH_TOKEN_HERE**},DEPLOY_TIME=${TIMESTAMP}" --project=serendia
+
