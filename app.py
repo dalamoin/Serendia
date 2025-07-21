@@ -25,7 +25,7 @@ PROCORE_CLIENT_SECRET = os.environ.get('PROCORE_CLIENT_SECRET')
 PROCORE_REDIRECT_URI = os.environ.get('PROCORE_REDIRECT_URI')
 PROCORE_ENVIRONMENT = os.environ.get('PROCORE_ENVIRONMENT', 'sandbox')
 
-# Custom Field IDs for Tier checkboxes
+# Custom Field IDs for Tier checkboxes (update these with your actual field IDs)
 TIER_FIELD_IDS = {
     'Auto-Approve': '4334',
     'Tier 1': '4335',
@@ -57,14 +57,36 @@ class ProcoreWebhookPayload:
     payload_version: str
     data: Optional[Dict] = None
 
-class ProcoreAPIClient:
-    """Procore API client with OAuth 2.0 authentication and automatic token refresh"""
+class UIUpdatingProcoreAPIClient:
+    """Procore API client with UI update capabilities"""
     
     def __init__(self):
         self.access_token = os.environ.get('PROCORE_ACCESS_TOKEN')
         self.refresh_token = os.environ.get('PROCORE_REFRESH_TOKEN')
         self.token_expires_at = None
         self.environment = PROCORE_ENVIRONMENT
+        
+        # Processing statistics
+        self.webhooks_processed = 0
+        self.pos_processed = 0
+        self.approval_updates = 0
+        self.ui_updates = 0
+        self.processing_errors = 0
+        
+        # Monitoring settings
+        self.refresh_count = 0
+        self.token_created_at = datetime.now()
+        self.consecutive_failures = 0
+        self.last_refresh_success = None
+        self.last_refresh_failure = None
+        
+        # Health monitoring thresholds
+        self.refresh_alert_threshold = int(os.environ.get('REFRESH_ALERT_THRESHOLD', '100'))
+        self.failure_alert_threshold = int(os.environ.get('FAILURE_ALERT_THRESHOLD', '3'))
+        self.token_age_alert_days = int(os.environ.get('TOKEN_AGE_ALERT_DAYS', '60'))
+        
+        # Notification settings
+        self.enable_notifications = os.environ.get('ENABLE_NOTIFICATIONS', 'true').lower() == 'true'
         
         # Set base URLs based on environment
         if self.environment == 'production':
@@ -74,19 +96,14 @@ class ProcoreAPIClient:
             self.oauth_base = 'https://sandbox.procore.com'
             self.api_base = 'https://sandbox.procore.com'
         
-        # If we have a token from environment, set expiration to trigger refresh checks
+        # Load existing tokens
         if self.access_token:
-            logger.info(f"Loaded access token from environment variable (length: {len(self.access_token)})")
-            # Set a conservative expiration time to trigger refresh validation
-            # This ensures the system will check token validity and refresh if needed
+            logger.info(f"Loaded access token from environment (length: {len(self.access_token)})")
             self.token_expires_at = datetime.now() + timedelta(minutes=5)
-            logger.info(f"Set token expiration trigger to: {self.token_expires_at.isoformat()}")
-            logger.info(f"ENV_ACCESS_TOKEN: {self.access_token}")
         
         if self.refresh_token:
-            logger.info(f"Loaded refresh token from environment variable (length: {len(self.refresh_token)})")
-            logger.info(f"ENV_REFRESH_TOKEN: {self.refresh_token}")
-    
+            logger.info(f"Loaded refresh token from environment (length: {len(self.refresh_token)})")
+
     def authenticate(self, authorization_code: str = None):
         """Authenticate using OAuth 2.0"""
         if authorization_code:
@@ -111,17 +128,22 @@ class ProcoreAPIClient:
             response.raise_for_status()
             token_data = response.json()
             
+            # Reset monitoring counters for new authentication
             self.access_token = token_data['access_token']
             self.refresh_token = token_data.get('refresh_token')
             expires_in = token_data.get('expires_in', 7200)
             self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
             
+            # Reset monitoring tracking
+            self.refresh_count = 0
+            self.token_created_at = datetime.now()
+            self.consecutive_failures = 0
+            self.last_refresh_success = datetime.now()
+            self.last_refresh_failure = None
+            
             logger.info(f"NEW_ACCESS_TOKEN: {self.access_token}")
             logger.info(f"NEW_REFRESH_TOKEN: {self.refresh_token}")
-            logger.info(f"Token expires at: {self.token_expires_at.isoformat()}")
-            logger.info(f"Successfully authenticated with Procore {self.environment}")
-            logger.info(f"DEPLOY_COMMAND: Add these to your next deployment:")
-            logger.info(f"--set-env-vars='PROCORE_ACCESS_TOKEN={self.access_token},PROCORE_REFRESH_TOKEN={self.refresh_token}'")
+            logger.info(f"🔄 Authentication successful - Ready for PO processing with UI updates")
             
             return True
             
@@ -130,9 +152,11 @@ class ProcoreAPIClient:
             return False
     
     def _refresh_access_token(self) -> bool:
-        """Refresh the access token using refresh token"""
+        """Enhanced refresh with comprehensive monitoring"""
+        
         if not self.refresh_token:
             logger.error("No refresh token available")
+            self._record_refresh_failure("No refresh token available")
             return False
             
         url = f"{self.oauth_base}/oauth/token"
@@ -144,30 +168,73 @@ class ProcoreAPIClient:
         }
         
         try:
-            logger.info("Attempting to refresh access token")
+            logger.info(f"Token refresh attempt #{self.refresh_count + 1}")
             response = requests.post(url, data=data)
             
             if response.status_code == 200:
                 token_data = response.json()
                 
+                # Update tokens
                 self.access_token = token_data['access_token']
                 self.refresh_token = token_data.get('refresh_token', self.refresh_token)
                 expires_in = token_data.get('expires_in', 7200)
                 self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
                 
-                logger.info(f"Token refreshed successfully. New token expires at: {self.token_expires_at.isoformat()}")
-                logger.info(f"REFRESHED_ACCESS_TOKEN: {self.access_token}")
-                logger.info(f"REFRESHED_REFRESH_TOKEN: {self.refresh_token}")
-                logger.info("✅ Automatic token refresh successful")
+                # Record successful refresh
+                self._record_refresh_success()
                 
+                logger.info(f"✅ Token refresh successful (#{self.refresh_count})")
                 return True
             else:
-                logger.error(f"Token refresh failed: {response.status_code} - {response.text}")
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Token refresh failed: {error_msg}")
+                self._record_refresh_failure(error_msg)
                 return False
             
         except Exception as e:
-            logger.error(f"Error refreshing token: {str(e)}")
+            error_msg = f"Exception: {str(e)}"
+            logger.error(f"Error refreshing token: {error_msg}")
+            self._record_refresh_failure(error_msg)
             return False
+    
+    def _record_refresh_success(self):
+        """Record successful refresh for monitoring"""
+        self.refresh_count += 1
+        self.consecutive_failures = 0
+        self.last_refresh_success = datetime.now()
+    
+    def _record_refresh_failure(self, error_msg: str):
+        """Record failed refresh for monitoring"""
+        self.consecutive_failures += 1
+        self.last_refresh_failure = datetime.now()
+        
+        if self.consecutive_failures >= self.failure_alert_threshold:
+            self._send_admin_notification(
+                f"🚨 HIGH PRIORITY: {self.consecutive_failures} consecutive token refresh failures. "
+                f"Last error: {error_msg}"
+            )
+    
+    def _send_admin_notification(self, message: str):
+        """Send notification to administrators"""
+        
+        if not self.enable_notifications:
+            logger.info(f"📧 NOTIFICATION (disabled): {message}")
+            return
+            
+        webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+        if webhook_url:
+            try:
+                payload = {
+                    "text": f"🤖 Procore PO Automation: {message}",
+                    "channel": "#procore-automation",
+                    "username": "PO Automation"
+                }
+                requests.post(webhook_url, json=payload)
+                logger.info("📧 Admin notification sent to Slack")
+            except Exception as e:
+                logger.error(f"Failed to send Slack notification: {e}")
+        else:
+            logger.info(f"📧 NOTIFICATION: {message}")
     
     def _ensure_valid_token(self) -> bool:
         """Ensure we have a valid access token, refreshing if necessary"""
@@ -178,11 +245,7 @@ class ProcoreAPIClient:
         # Check if token is expired or about to expire
         if self.token_expires_at and datetime.now() >= self.token_expires_at:
             logger.info("Access token is expired, attempting to refresh")
-            if self.refresh_token:
-                return self._refresh_access_token()
-            else:
-                logger.error("No refresh token available for token refresh")
-                return False
+            return self._refresh_access_token()
         
         return True
     
@@ -209,9 +272,11 @@ class ProcoreAPIClient:
                 logger.error("Token refresh failed, request cannot be retried")
         
         return response
+
+    # ===== CORE PO PROCESSING METHODS (from working code) =====
     
     def get_purchase_order_by_id(self, resource_id: str, project_id: str, company_id: str) -> Optional[Dict]:
-        """Get specific PO using filters"""
+        """Get specific PO using filters (from working code)"""
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts"
         headers = {
             'Procore-Company-Id': str(company_id),
@@ -237,10 +302,11 @@ class ProcoreAPIClient:
             
         except Exception as e:
             logger.error(f"Failed to get PO {resource_id}: {e}")
+            self.processing_errors += 1
             return None
     
     def get_po_line_items(self, resource_id: str, project_id: str, company_id: str) -> Optional[List[Dict]]:
-        """Get PO line items"""
+        """Get PO line items (from working code)"""
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}/line_items"
         headers = {
             'Procore-Company-Id': str(company_id),
@@ -260,7 +326,7 @@ class ProcoreAPIClient:
             return None
     
     def get_budget_views(self, project_id: str, company_id: str) -> Optional[List[Dict]]:
-        """Get budget views"""
+        """Get budget views (from working code)"""
         url = f"{self.api_base}/rest/v1.0/budget_views"
         headers = {
             'Procore-Company-Id': str(company_id),
@@ -280,7 +346,7 @@ class ProcoreAPIClient:
             return None
     
     def get_budget_detail_rows(self, budget_view_id: str, project_id: str, company_id: str) -> Optional[List[Dict]]:
-        """Get budget detail rows"""
+        """Get budget detail rows (from working code)"""
         url = f"{self.api_base}/rest/v1.0/budget_views/{budget_view_id}/detail_rows"
         headers = {
             'Procore-Company-Id': str(company_id),
@@ -298,9 +364,11 @@ class ProcoreAPIClient:
         except Exception as e:
             logger.error(f"Failed to get budget detail rows: {e}")
             return None
+
+    # ===== CRITICAL UI UPDATE METHOD (from working code) =====
     
     def update_po_tiers(self, resource_id: str, project_id: str, company_id: str, tier: str) -> bool:
-        """Update PO with tier checkboxes"""
+        """Update PO with tier checkboxes - THIS IS WHAT UPDATES THE UI"""
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}"
         headers = {
             'Procore-Company-Id': str(company_id),
@@ -309,7 +377,7 @@ class ProcoreAPIClient:
         }
         params = {'run_configurable_validations': 'true'}
         
-        # Set only the target tier to true, others to false
+        # Set only the target tier to true, others to false - THIS TRIGGERS UI REFRESH
         custom_fields = {}
         for tier_name, field_id in TIER_FIELD_IDS.items():
             custom_fields[f"custom_field_{field_id}"] = 'true' if tier_name == tier else 'false'
@@ -320,15 +388,18 @@ class ProcoreAPIClient:
         }
         
         try:
-            logger.info(f"Updating PO {resource_id} with {tier}")
+            logger.info(f"🔄 Updating PO {resource_id} with {tier} - THIS WILL UPDATE THE UI")
             response = self._make_authenticated_request('PATCH', url, headers=headers, params=params, json=payload)
             response.raise_for_status()
             
-            logger.info(f"Updated PO {resource_id} to {tier}")
+            logger.info(f"✅ Updated PO {resource_id} to {tier} - UI should now show changes")
+            self.approval_updates += 1
+            self.ui_updates += 1
             return True
             
         except Exception as e:
-            logger.error(f"Failed to update PO {resource_id}: {e}")
+            logger.error(f"❌ Failed to update PO {resource_id}: {e}")
+            self.processing_errors += 1
             return False
 
     def add_po_log(self, resource_id: str, project_id: str, company_id: str, 
@@ -336,7 +407,7 @@ class ProcoreAPIClient:
                    po_data: Dict = None, budget_analysis: Dict = None,
                    has_potential_change_orders: bool = False, 
                    unallocated_cost_present: bool = False) -> bool:
-        """Add justification log to PO after tier assignment"""
+        """Add justification log to PO after tier assignment (from working code)"""
         url = f"{self.api_base}/rest/v1.0/purchase_order_contracts/{resource_id}"
         headers = {
             'Procore-Company-Id': str(company_id),
@@ -390,105 +461,43 @@ class ProcoreAPIClient:
             # Join all lines with newline characters
             justification_text = "\n".join(log_lines)
             
-            # Use simple string format (not rich_text object)
+            # Use justification field (update field ID if different)
             payload = {
                 "project_id": int(project_id),
                 "purchase_order_contract": {
-                    "custom_field_4367": justification_text
+                    "custom_field_4367": justification_text  # Update this field ID if needed
                 }
             }
             
-            logger.info(f"Adding justification log to PO {resource_id}")
-            logger.info(f"Justification content preview: {justification_text[:100]}...")
+            logger.info(f"📝 Adding justification log to PO {resource_id}")
             
             response = self._make_authenticated_request('PATCH', url, headers=headers, params=params, json=payload)
             response.raise_for_status()
             
-            logger.info(f"Successfully added justification log to PO {resource_id}")
+            logger.info(f"✅ Successfully added justification log to PO {resource_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to add log to PO {resource_id}: {e}")
+            logger.error(f"❌ Failed to add log to PO {resource_id}: {e}")
             return False
-    
-    def test_token_refresh(self) -> Dict[str, any]:
-        """Test method to check token refresh functionality"""
-        try:
-            logger.info("🧪 TESTING: Token refresh functionality")
-            
-            # Store original values
-            original_expires_at = self.token_expires_at
-            original_access_token = self.access_token
-            
-            # Force token expiration for testing
-            logger.info("🧪 TESTING: Forcing token expiration")
-            self.token_expires_at = datetime.now() - timedelta(minutes=1)
-            
-            # Test _ensure_valid_token (should trigger refresh)
-            logger.info("🧪 TESTING: Calling _ensure_valid_token (should trigger refresh)")
-            refresh_result = self._ensure_valid_token()
-            
-            if refresh_result:
-                new_expires_at = self.token_expires_at
-                new_access_token = self.access_token
-                
-                # Test if token actually changed
-                token_changed = new_access_token != original_access_token
-                expiration_updated = new_expires_at != original_expires_at
-                
-                logger.info(f"🧪 TESTING: Token refresh test completed")
-                logger.info(f"🧪 TESTING: Refresh successful: {refresh_result}")
-                logger.info(f"🧪 TESTING: Token changed: {token_changed}")
-                logger.info(f"🧪 TESTING: Expiration updated: {expiration_updated}")
-                
-                return {
-                    'refresh_successful': refresh_result,
-                    'token_changed': token_changed,
-                    'expiration_updated': expiration_updated,
-                    'new_expires_at': new_expires_at.isoformat() if new_expires_at else None,
-                    'original_expires_at': original_expires_at.isoformat() if original_expires_at else None
-                }
-            else:
-                logger.error("🧪 TESTING: Token refresh failed")
-                # Restore original expiration if refresh failed
-                self.token_expires_at = original_expires_at
-                return {
-                    'refresh_successful': False,
-                    'error': 'Token refresh failed'
-                }
-                
-        except Exception as e:
-            logger.error(f"🧪 TESTING: Token refresh test error: {str(e)}")
-            return {
-                'refresh_successful': False,
-                'error': str(e)
-            }
 
-class ApprovalEngine:
-    """Business logic for approval tiers"""
-    
-    def __init__(self, api_client: ProcoreAPIClient):
-        self.api = api_client
+    # ===== BUSINESS LOGIC ENGINE (from working code) =====
     
     def calculate_approval_tier(self, project_id: str, resource_id: str, company_id: str, webhook_timestamp: str = None) -> Tuple[str, str]:
-        """Calculate approval tier using updated business logic"""
+        """Calculate approval tier using updated business logic (from working code)"""
         try:
-            logger.info(f"Processing approval logic for PO {resource_id}")
+            logger.info(f"🔄 Processing approval logic for PO {resource_id}")
             logger.info(f"Keys identified: company_id: {company_id}, project_id: {project_id}, resource_id: {resource_id}")
-            
-            # Step 2: Authentication Check (already done in _ensure_valid_token)
-            logger.info("Successfully authenticated with Procore sandbox")
             
             # Step 3: Purchase Order Data Extraction
             logger.info("=== STEP 3: PO DATA EXTRACTION ===")
-            po_data = self.api.get_purchase_order_by_id(resource_id, project_id, company_id)
+            po_data = self.get_purchase_order_by_id(resource_id, project_id, company_id)
             if not po_data:
                 logger.error(f"Could not retrieve PO {resource_id}")
-                # For error cases, still add log
                 error_reason = f"Could not retrieve PO {resource_id}"
                 if webhook_timestamp:
-                    self.api.add_po_log(resource_id, project_id, company_id, 
-                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp)
+                    self.add_po_log(resource_id, project_id, company_id, 
+                                  ApprovalTier.TIER_4, error_reason, webhook_timestamp)
                 return ApprovalTier.TIER_4, error_reason
             
             grand_total = float(po_data.get('grand_total', 0) or 0)
@@ -498,14 +507,14 @@ class ApprovalEngine:
             
             # Step 4: Line Items Analysis
             logger.info("=== STEP 4: LINE ITEMS ANALYSIS ===")
-            line_items = self.api.get_po_line_items(resource_id, project_id, company_id)
+            line_items = self.get_po_line_items(resource_id, project_id, company_id)
             if not line_items:
                 logger.error(f"Could not retrieve line items for PO {resource_id}")
                 error_reason = f"Could not retrieve line items for PO {resource_id}"
                 if webhook_timestamp:
-                    self.api.add_po_log(resource_id, project_id, company_id, 
-                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
-                                      po_data=po_data)
+                    self.add_po_log(resource_id, project_id, company_id, 
+                                  ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                  po_data=po_data)
                 return ApprovalTier.TIER_4, error_reason
             
             # Process line items and group by wbs_code
@@ -519,9 +528,9 @@ class ApprovalEngine:
                 wbs_code = item.get('wbs_code', {})
                 cost_code = item.get('cost_code', {})
                 
-                # Check for unallocated costs
+                # Check for unallocated costs (update this ID if different)
                 cost_code_id = cost_code.get('id') if isinstance(cost_code, dict) else None
-                if cost_code_id == 9427186:
+                if cost_code_id == 9427186:  # Update this ID for your unallocated cost code
                     unallocated_cost_present = True
                 
                 # Group by wbs_code for budget matching
@@ -539,16 +548,16 @@ class ApprovalEngine:
             
             # Step 5: Budget View Data Retrieval
             logger.info("=== STEP 5: BUDGET VIEW ID STORED ===")
-            budget_views = self.api.get_budget_views(project_id, company_id)
+            budget_views = self.get_budget_views(project_id, company_id)
             if not budget_views:
                 logger.error("Could not get budget views")
                 error_reason = "Could not get budget views"
                 if webhook_timestamp:
-                    self.api.add_po_log(resource_id, project_id, company_id, 
-                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
-                                      po_data=po_data, 
-                                      has_potential_change_orders=has_potential_change_orders,
-                                      unallocated_cost_present=unallocated_cost_present)
+                    self.add_po_log(resource_id, project_id, company_id, 
+                                  ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                  po_data=po_data, 
+                                  has_potential_change_orders=has_potential_change_orders,
+                                  unallocated_cost_present=unallocated_cost_present)
                 return ApprovalTier.TIER_4, error_reason
             
             budget_view_id = budget_views[0]['id']
@@ -556,16 +565,16 @@ class ApprovalEngine:
             
             # Step 6: Budget View Detail Rows Retrieval
             logger.info("=== STEP 6: BUDGET DATA RECEIVED ===")
-            budget_rows = self.api.get_budget_detail_rows(budget_view_id, project_id, company_id)
+            budget_rows = self.get_budget_detail_rows(budget_view_id, project_id, company_id)
             if not budget_rows:
                 logger.error("Could not get budget detail rows")
                 error_reason = "Could not get budget detail rows"
                 if webhook_timestamp:
-                    self.api.add_po_log(resource_id, project_id, company_id, 
-                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
-                                      po_data=po_data,
-                                      has_potential_change_orders=has_potential_change_orders,
-                                      unallocated_cost_present=unallocated_cost_present)
+                    self.add_po_log(resource_id, project_id, company_id, 
+                                  ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                  po_data=po_data,
+                                  has_potential_change_orders=has_potential_change_orders,
+                                  unallocated_cost_present=unallocated_cost_present)
                 return ApprovalTier.TIER_4, error_reason
             
             # Create budget lookup by wbs_code
@@ -605,11 +614,11 @@ class ApprovalEngine:
                     logger.error(f"No matching budget row found for wbs_code: {wbs_key}")
                     error_reason = f"No matching budget row found for wbs_code: {wbs_key}"
                     if webhook_timestamp:
-                        self.api.add_po_log(resource_id, project_id, company_id, 
-                                          ApprovalTier.TIER_4, error_reason, webhook_timestamp,
-                                          po_data=po_data,
-                                          has_potential_change_orders=has_potential_change_orders,
-                                          unallocated_cost_present=unallocated_cost_present)
+                        self.add_po_log(resource_id, project_id, company_id, 
+                                      ApprovalTier.TIER_4, error_reason, webhook_timestamp,
+                                      po_data=po_data,
+                                      has_potential_change_orders=has_potential_change_orders,
+                                      unallocated_cost_present=unallocated_cost_present)
                     return ApprovalTier.TIER_4, error_reason
                 
                 # Calculate future committed costs
@@ -645,7 +654,7 @@ class ApprovalEngine:
             tier = None
             reason = None
             
-            # Tier 4 Conditions (Highest Priority) - Old Tier 5
+            # Tier 4 Conditions (Highest Priority)
             if is_any_overbudget:
                 tier = ApprovalTier.TIER_4
                 reason = f"Over budget on wbs_code level: {'; '.join(overbudget_details)}"
@@ -654,12 +663,12 @@ class ApprovalEngine:
                 tier = ApprovalTier.TIER_4
                 reason = "Has Potential Change Order and Unallocated Cost"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_4_CONDITION_2_TRIGGERED")
-            # Tier 3 Conditions - Old Tier 4
+            # Tier 3 Conditions
             elif has_potential_change_orders:
                 tier = ApprovalTier.TIER_3
                 reason = "Has potential change order=true"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_3_CONDITION_1_TRIGGERED")
-            # Tier 2 Conditions - Old Tier 3
+            # Tier 2 Conditions
             elif unallocated_cost_present:
                 tier = ApprovalTier.TIER_2
                 reason = "Unallocated cost code"
@@ -668,12 +677,12 @@ class ApprovalEngine:
                 tier = ApprovalTier.TIER_2
                 reason = "Grand total > $10,000"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_2_CONDITION_2_TRIGGERED")
-            # Tier 1 Conditions - Old Tier 2
+            # Tier 1 Conditions
             elif 5000 <= grand_total <= 10000:
                 tier = ApprovalTier.TIER_1
                 reason = "Grand total between $5,000-$10,000"
                 logger.info("BUSINESS_LOGIC_DECISION: TIER_1_CONDITION_1_TRIGGERED")
-            # Auto-Approve (Default) - Old Tier 1
+            # Auto-Approve (Default)
             else:
                 tier = ApprovalTier.AUTO_APPROVE
                 reason = "Grand total < $5,000"
@@ -681,10 +690,10 @@ class ApprovalEngine:
             
             # Add justification log if webhook timestamp is provided
             if webhook_timestamp:
-                self.api.add_po_log(resource_id, project_id, company_id, tier, reason, webhook_timestamp,
-                                  po_data=po_data, budget_analysis=budget_analysis,
-                                  has_potential_change_orders=has_potential_change_orders,
-                                  unallocated_cost_present=unallocated_cost_present)
+                self.add_po_log(resource_id, project_id, company_id, tier, reason, webhook_timestamp,
+                              po_data=po_data, budget_analysis=budget_analysis,
+                              has_potential_change_orders=has_potential_change_orders,
+                              unallocated_cost_present=unallocated_cost_present)
             
             return tier, reason
             
@@ -692,8 +701,8 @@ class ApprovalEngine:
             logger.error(f"Error calculating approval tier: {e}")
             error_reason = f"Error in calculation: {e}"
             if webhook_timestamp:
-                self.api.add_po_log(resource_id, project_id, company_id, 
-                                  ApprovalTier.TIER_4, error_reason, webhook_timestamp)
+                self.add_po_log(resource_id, project_id, company_id, 
+                              ApprovalTier.TIER_4, error_reason, webhook_timestamp)
             return ApprovalTier.TIER_4, error_reason
     
     def _get_wbs_key(self, wbs_code: Dict) -> Optional[str]:
@@ -715,9 +724,181 @@ class ApprovalEngine:
         
         return None
 
+    # ===== COMPLETE WEBHOOK PROCESSING (with UI updates) =====
+    
+    def process_purchase_order_webhook(self, payload: ProcoreWebhookPayload) -> bool:
+        """Process a Purchase Order webhook event with UI updates"""
+        try:
+            logger.info(f"🔔 Processing PO webhook: {payload.resource_type} - {payload.reason}")
+            
+            # Extract IDs
+            company_id = payload.company_id
+            project_id = payload.project_id
+            po_id = payload.resource_id
+            
+            # Only process create and update events
+            if payload.reason not in ['create', 'update']:
+                logger.info(f"Skipping {payload.reason} event")
+                return True
+            
+            # Check authentication
+            if not self._ensure_valid_token():
+                logger.error("Not authenticated - cannot process webhook")
+                return False
+            
+            # Calculate approval tier (includes logging)
+            tier, reason = self.calculate_approval_tier(
+                project_id, 
+                po_id, 
+                company_id,
+                payload.timestamp
+            )
+            
+            # **THIS IS THE KEY** - Update PO with tier checkboxes (triggers UI refresh)
+            ui_update_success = self.update_po_tiers(po_id, project_id, company_id, tier)
+            
+            if ui_update_success:
+                logger.info(f"✅ Successfully updated PO {po_id} to {tier} - UI should be updated")
+                self.webhooks_processed += 1
+                self.pos_processed += 1
+                
+                # Send notification for significant events
+                if tier == ApprovalTier.AUTO_APPROVE:
+                    self._send_admin_notification(
+                        f"🚀 PO Auto-Approved: PO {po_id} (${tier}) - {reason}"
+                    )
+                elif tier == ApprovalTier.TIER_4:
+                    self._send_admin_notification(
+                        f"🚨 High-Tier PO: PO {po_id} assigned to {tier} - {reason}"
+                    )
+                
+                return True
+            else:
+                logger.error(f"❌ Failed to update PO {po_id} with {tier}")
+                self.processing_errors += 1
+                return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing PO webhook: {e}")
+            self.processing_errors += 1
+            return False
+    
+    def get_monitoring_status(self) -> Dict:
+        """Get comprehensive monitoring status including UI update tracking"""
+        
+        token_age = datetime.now() - self.token_created_at
+        
+        # Calculate health score
+        health_score = 100
+        if self.consecutive_failures > 0:
+            health_score -= min(50, self.consecutive_failures * 10)
+        
+        # Factor in processing errors
+        if self.processing_errors > 0 and self.webhooks_processed > 0:
+            error_rate = (self.processing_errors / self.webhooks_processed) * 100
+            health_score -= min(30, error_rate)
+        
+        health_score = max(0, health_score)
+        
+        return {
+            'status': 'authenticated' if self.access_token else 'not_authenticated',
+            'environment': self.environment,
+            'token_expires_at': self.token_expires_at.isoformat() if self.token_expires_at else None,
+            
+            # Basic token info
+            'token_preview': f"{self.access_token[:20]}...{self.access_token[-10:]}" if self.access_token and len(self.access_token) > 30 else self.access_token,
+            'token_length': len(self.access_token) if self.access_token else 0,
+            'full_token': self.access_token,
+            'refresh_token': self.refresh_token,
+            
+            # Processing statistics
+            'webhooks_processed': self.webhooks_processed,
+            'pos_processed': self.pos_processed,
+            'approval_updates': self.approval_updates,
+            'ui_updates': self.ui_updates,  # NEW: Track UI updates
+            'processing_errors': self.processing_errors,
+            'processing_success_rate': round((self.pos_processed / max(1, self.webhooks_processed)) * 100, 2),
+            'ui_update_rate': round((self.ui_updates / max(1, self.pos_processed)) * 100, 2),  # NEW
+            
+            # Token monitoring
+            'total_refreshes': self.refresh_count,
+            'consecutive_failures': self.consecutive_failures,
+            'token_age_days': token_age.days,
+            'token_created_at': self.token_created_at.isoformat(),
+            
+            # Health indicators
+            'health_score': health_score,
+            'health_status': self._get_health_status(health_score),
+            
+            # Configuration
+            'tier_field_ids': TIER_FIELD_IDS,
+            'refresh_alert_threshold': self.refresh_alert_threshold,
+            'failure_alert_threshold': self.failure_alert_threshold,
+            'token_age_alert_days': self.token_age_alert_days,
+            'notifications_enabled': self.enable_notifications,
+            
+            # Recommendations
+            'recommendations': self._get_recommendations(),
+            'alerts': self._get_current_alerts()
+        }
+    
+    def _get_health_status(self, score: int) -> str:
+        """Get health status based on score"""
+        if score >= 90:
+            return "EXCELLENT"
+        elif score >= 75:
+            return "GOOD"
+        elif score >= 50:
+            return "FAIR"
+        elif score >= 25:
+            return "POOR"
+        else:
+            return "CRITICAL"
+    
+    def _get_recommendations(self) -> List[str]:
+        """Get system recommendations"""
+        recommendations = []
+        
+        if self.consecutive_failures > 0:
+            recommendations.append(f"Monitor authentication - {self.consecutive_failures} recent failures")
+        
+        if self.processing_errors > 0:
+            error_rate = (self.processing_errors / max(1, self.webhooks_processed)) * 100
+            if error_rate > 10:
+                recommendations.append(f"High error rate: {error_rate:.1f}% - Review processing logs")
+        
+        if self.webhooks_processed == 0:
+            recommendations.append("No webhooks processed yet - System ready for PO automation")
+        
+        if self.ui_updates < self.pos_processed:
+            ui_update_rate = (self.ui_updates / max(1, self.pos_processed)) * 100
+            if ui_update_rate < 90:
+                recommendations.append(f"UI update rate: {ui_update_rate:.1f}% - Some POs may not show tier changes")
+        
+        if not recommendations:
+            recommendations.append("All systems operating normally - UI updates working")
+            
+        return recommendations
+    
+    def _get_current_alerts(self) -> List[str]:
+        """Get current alert conditions"""
+        alerts = []
+        
+        if self.consecutive_failures >= self.failure_alert_threshold:
+            alerts.append(f"HIGH: {self.consecutive_failures} consecutive authentication failures")
+        
+        if self.processing_errors > 5:
+            alerts.append(f"MEDIUM: {self.processing_errors} processing errors detected")
+        
+        if self.ui_updates < self.pos_processed:
+            missing_ui_updates = self.pos_processed - self.ui_updates
+            if missing_ui_updates > 3:
+                alerts.append(f"MEDIUM: {missing_ui_updates} POs processed without UI updates")
+        
+        return alerts
+
 # Global instances
-api_client = ProcoreAPIClient()
-approval_engine = ApprovalEngine(api_client)
+api_client = UIUpdatingProcoreAPIClient()
 
 def parse_webhook_payload(data: Dict) -> Optional[ProcoreWebhookPayload]:
     """Parse webhook payload"""
@@ -738,11 +919,12 @@ def parse_webhook_payload(data: Dict) -> Optional[ProcoreWebhookPayload]:
         logger.error(f"Error parsing webhook payload: {e}")
         return None
 
+# ===== FLASK ROUTES =====
+
 @app.route('/', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    logger.info("Health check hit")
-    return 'Procore Integration Service is running', 200
+    return 'Procore PO Automation Service - UI Updates Active', 200
 
 @app.route('/oauth/callback', methods=['GET'])
 def oauth_callback():
@@ -758,8 +940,8 @@ def oauth_callback():
         return 'Missing authorization code', 400
     
     if api_client.authenticate(code):
-        logger.info("OAuth authentication successful")
-        return 'Authentication successful! Webhook processing is now active.', 200
+        logger.info("OAuth authentication successful - Ready for PO processing with UI updates")
+        return 'Authentication successful! Purchase Order automation with UI updates is now active.', 200
     else:
         return 'Authentication failed', 500
 
@@ -768,76 +950,89 @@ def auth_status():
     """Check authentication status"""
     try:
         if api_client.access_token and api_client._ensure_valid_token():
-            token_preview = f"{api_client.access_token[:20]}...{api_client.access_token[-10:]}" if len(api_client.access_token) > 30 else api_client.access_token
+            monitoring_status = api_client.get_monitoring_status()
             
             return jsonify({
-                'status': 'authenticated',
-                'expires_at': api_client.token_expires_at.isoformat() if api_client.token_expires_at else None,
-                'environment': api_client.environment,
-                'token_preview': token_preview,
-                'token_length': len(api_client.access_token),
-                'full_token': api_client.access_token,
-                'refresh_token': api_client.refresh_token
+                'status': monitoring_status['status'],
+                'expires_at': monitoring_status['token_expires_at'],
+                'environment': monitoring_status['environment'],
+                'token_preview': monitoring_status['token_preview'],
+                'token_length': monitoring_status['token_length'],
+                'full_token': monitoring_status['full_token'],
+                'refresh_token': monitoring_status['refresh_token'],
+                'processing_stats': {
+                    'webhooks_processed': monitoring_status['webhooks_processed'],
+                    'pos_processed': monitoring_status['pos_processed'],
+                    'ui_updates': monitoring_status['ui_updates'],
+                    'success_rate': monitoring_status['processing_success_rate'],
+                    'ui_update_rate': monitoring_status['ui_update_rate']
+                }
             }), 200
         else:
             return jsonify({
                 'status': 'not_authenticated',
-                'oauth_url': f"https://{api_client.oauth_base.split('//')[1]}/oauth/authorize?client_id={PROCORE_CLIENT_ID}&response_type=code&redirect_uri={PROCORE_REDIRECT_URI}"
+                'oauth_url': f"{api_client.oauth_base}/oauth/authorize?client_id={PROCORE_CLIENT_ID}&response_type=code&redirect_uri={PROCORE_REDIRECT_URI}"
             }), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/test/token-refresh', methods=['GET'])
-def test_token_refresh():
-    """Test endpoint for token refresh functionality"""
+@app.route('/auth/monitoring-status', methods=['GET'])
+def monitoring_status():
+    """Get detailed monitoring status"""
     try:
-        logger.info("🧪 TEST ENDPOINT: Token refresh test requested")
-        result = api_client.test_token_refresh()
-        return jsonify({
-            'test_name': 'token_refresh_test',
-            'timestamp': datetime.now().isoformat(),
-            'result': result
-        }), 200
+        status = api_client.get_monitoring_status()
+        return jsonify(status), 200
     except Exception as e:
-        logger.error(f"🧪 TEST ENDPOINT: Error in token refresh test: {str(e)}")
-        return jsonify({
-            'test_name': 'token_refresh_test',
-            'timestamp': datetime.now().isoformat(),
-            'error': str(e)
-        }), 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/test/api-call', methods=['GET'])
-def test_api_call():
-    """Test endpoint to make an API call and check if token refresh works"""
+@app.route('/config/tier-fields', methods=['GET'])
+def get_tier_fields():
+    """Get current tier field configuration"""
+    return jsonify({
+        'tier_field_ids': TIER_FIELD_IDS,
+        'environment': PROCORE_ENVIRONMENT,
+        'note': 'These field IDs should match your Procore custom field IDs for tier checkboxes'
+    }), 200
+
+@app.route('/test/process-po', methods=['POST'])
+def test_process_po():
+    """Test endpoint to manually process a PO with UI updates"""
     try:
-        logger.info("🧪 TEST ENDPOINT: API call test requested")
+        data = request.get_json()
+        company_id = data.get('company_id')
+        project_id = data.get('project_id')
+        po_id = data.get('po_id')
         
-        # Try to make a simple API call that will trigger token validation
-        project_id = request.args.get('project_id', '270670')
-        company_id = request.args.get('company_id', '4264580')
+        if not all([company_id, project_id, po_id]):
+            return jsonify({'error': 'Missing required parameters: company_id, project_id, po_id'}), 400
         
-        budget_views = api_client.get_budget_views(project_id, company_id)
+        # Create test webhook payload
+        test_payload = ProcoreWebhookPayload(
+            id='test-' + str(datetime.now().timestamp()),
+            timestamp=datetime.now().isoformat(),
+            reason='test',
+            company_id=company_id,
+            project_id=project_id,
+            user_id='test',
+            resource_type='Purchase Order Contracts',
+            resource_id=po_id,
+            payload_version='1.0'
+        )
         
-        if budget_views is not None:
-            return jsonify({
-                'test_name': 'api_call_test',
-                'timestamp': datetime.now().isoformat(),
-                'success': True,
-                'budget_views_count': len(budget_views),
-                'token_expires_at': api_client.token_expires_at.isoformat() if api_client.token_expires_at else None
-            }), 200
-        else:
-            return jsonify({
-                'test_name': 'api_call_test',
-                'timestamp': datetime.now().isoformat(),
-                'success': False,
-                'error': 'API call returned None'
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"🧪 TEST ENDPOINT: Error in API call test: {str(e)}")
+        # Process the PO with UI updates
+        result = api_client.process_purchase_order_webhook(test_payload)
+        
         return jsonify({
-            'test_name': 'api_call_test',
+            'test_name': 'manual_po_processing_with_ui_updates',
+            'timestamp': datetime.now().isoformat(),
+            'success': result,
+            'po_id': po_id,
+            'monitoring_status': api_client.get_monitoring_status()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'test_name': 'manual_po_processing_with_ui_updates',
             'timestamp': datetime.now().isoformat(),
             'error': str(e)
         }), 500
@@ -845,16 +1040,15 @@ def test_api_call():
 @app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
-    """Handle Procore webhook"""
+    """Handle Procore webhook with UI updates"""
     try:
-        logger.info("Webhook received")
+        logger.info("🔔 Webhook received")
         
-        # Quick validation - return fast for invalid requests
+        # Validate JSON payload
         if not request.is_json:
             logger.warning("Non-JSON webhook received")
             return 'OK', 200
         
-        # Parse JSON payload
         json_data = request.get_json(silent=True)
         if not json_data:
             logger.warning("Invalid JSON payload")
@@ -866,7 +1060,7 @@ def handle_webhook():
             logger.warning("Failed to parse webhook payload")
             return 'OK', 200
         
-        # Only process PO events - return quickly for others
+        # Only process PO events
         if payload.resource_type not in ['Purchase Order Contracts', 'Purchase Order Contract Line Items']:
             logger.info(f"Ignoring {payload.resource_type} event")
             return 'OK', 200
@@ -892,43 +1086,25 @@ def handle_webhook():
             logger.warning("Cannot determine PO ID")
             return 'OK', 200
         
-        # Check authentication - return OK but log if not authenticated
-        if not api_client.access_token or not api_client._ensure_valid_token():
-            logger.error("Not authenticated - skipping processing")
-            return 'OK', 200
+        # Update the payload with the correct PO ID
+        payload.resource_id = po_id
         
-        # Process approval tier calculation
-        try:
-            # Calculate approval tier (now includes logging)
-            approval_tier, reason = approval_engine.calculate_approval_tier(
-                payload.project_id, 
-                po_id, 
-                payload.company_id,
-                payload.timestamp  # Pass webhook timestamp for logging
-            )
-            
-            # Update PO with tier
-            success = api_client.update_po_tiers(
-                po_id,
-                payload.project_id, 
-                payload.company_id,
-                approval_tier
-            )
-            
-            if success:
-                logger.info(f"Updated PO {po_id} to Tier {approval_tier}")
-            else:
-                logger.error(f"Failed to update PO {po_id}")
-                
-        except Exception as processing_error:
-            logger.error(f"Error in processing: {processing_error}")
+        logger.info(f"🔄 Processing webhook: PO {po_id} - {payload.reason}")
+        
+        # **PROCESS WITH UI UPDATES**
+        success = api_client.process_purchase_order_webhook(payload)
+        
+        if success:
+            logger.info(f"✅ Successfully processed webhook for PO {po_id} - UI should be updated")
+        else:
+            logger.error(f"❌ Failed to process webhook for PO {po_id}")
         
         # Always return OK to Procore
         return 'OK', 200
         
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        # Always return OK to avoid webhook queueing
+        logger.error(f"❌ Error processing webhook: {e}")
+        api_client.processing_errors += 1
         return 'OK', 200
 
 if __name__ == '__main__':
@@ -939,8 +1115,18 @@ if __name__ == '__main__':
         logger.error(f"Missing required environment variables: {missing_vars}")
         sys.exit(1)
     
-    logger.info(f"Starting Procore Integration Service (Environment: {PROCORE_ENVIRONMENT})")
-    logger.info(f"OAuth callback URL: {PROCORE_REDIRECT_URI}")
+    logger.info(f"🚀 Starting Procore PO Automation Service with UI Updates")
+    logger.info(f"Environment: {PROCORE_ENVIRONMENT}")
+    logger.info(f"OAuth callback: {PROCORE_REDIRECT_URI}")
+    logger.info(f"Tier Field IDs: {TIER_FIELD_IDS}")
+    logger.info(f"🎯 Key Feature: UI updates via tier checkbox updates")
+    logger.info(f"🔧 Ready to process Purchase Order webhooks with live UI updates")
+    
+    # Get port from environment variable (Cloud Run requirement)
+    port = int(os.environ.get('PORT', 8080))
+    logger.info(f"Starting server on port {port}")
+    
+    app.run(debug=False, host='0.0.0.0', port=port)
     
     port = int(os.environ.get('PORT', 8080))
     app.run(debug=False, host='0.0.0.0', port=port)
